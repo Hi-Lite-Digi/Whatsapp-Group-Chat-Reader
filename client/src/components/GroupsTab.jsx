@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
-import { Users, Search, RefreshCw, CheckCircle, XCircle, FileCode } from 'lucide-react';
+import { Users, Search, RefreshCw, CheckCircle, XCircle, FileCode, Database, History } from 'lucide-react';
 
-export default function GroupsTab({ groups, schemas, onUpdateGroup, onSyncGroups }) {
+export default function GroupsTab({ groups, schemas, oracleSuppliers = [], onUpdateGroup, onSyncGroups, onRequestHistory }) {
   const [search, setSearch] = useState('');
+  const [historyStatus, setHistoryStatus] = useState({});
 
   const filteredGroups = groups.filter(g =>
     (g.name || '').toLowerCase().includes(search.toLowerCase()) ||
@@ -50,8 +51,14 @@ export default function GroupsTab({ groups, schemas, onUpdateGroup, onSyncGroups
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: '20px' }}>
           {filteredGroups.map(group => {
             const isMonitored = group.is_monitored === 1;
+            const oracleSyncEnabled = group.oracle_sync_enabled === 1;
+            const supplierCode = group.oracle_supplier_code || '';
+            const supplierSenderIds = group.oracle_supplier_sender_ids || '';
+            const messageCount = Number(group.message_count || 0);
+            const firstMessage = group.first_message_at ? new Date(group.first_message_at).toLocaleString() : null;
+            const lastMessage = group.last_message_at ? new Date(group.last_message_at).toLocaleString() : null;
             return (
-              <div key={group.id} className="glass-panel" style={{ padding: '20px', borderColor: isMonitored ? 'rgba(37, 211, 102, 0.4)' : 'var(--border-color)' }}>
+              <div key={group.id} className="glass-panel" style={{ padding: '20px', borderColor: oracleSyncEnabled ? 'rgba(6, 182, 212, 0.5)' : isMonitored ? 'rgba(37, 211, 102, 0.4)' : 'var(--border-color)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '12px' }}>
                   <div>
                     <h3 style={{ fontSize: '1.05rem', fontWeight: 600, color: '#ffffff' }}>{group.name}</h3>
@@ -66,6 +73,36 @@ export default function GroupsTab({ groups, schemas, onUpdateGroup, onSyncGroups
                 </div>
 
                 <div style={{ marginTop: '20px', paddingTop: '16px', borderTop: '1px solid var(--border-color)', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  <div style={{ padding: '12px 14px', borderRadius: '12px', background: 'rgba(37, 211, 102, 0.06)', border: '1px solid rgba(37, 211, 102, 0.18)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' }}>
+                      <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <History size={14} /> Stored history
+                      </span>
+                      <strong style={{ color: '#ffffff' }}>{messageCount} message{messageCount === 1 ? '' : 's'}</strong>
+                    </div>
+                    <p style={{ color: 'var(--text-dim)', fontSize: '0.75rem', lineHeight: 1.45, marginTop: '7px' }}>
+                      {messageCount > 0
+                        ? `${firstMessage} to ${lastMessage}`
+                        : 'No history has been supplied by WhatsApp for this linked account yet.'}
+                    </p>
+                    {isMonitored && (
+                      <button
+                        className="btn btn-secondary"
+                        style={{ width: '100%', marginTop: '10px' }}
+                        onClick={async () => {
+                          const result = await onRequestHistory(group.id);
+                          setHistoryStatus(previous => ({ ...previous, [group.id]: result.message }));
+                        }}
+                      >
+                        <History size={14} /> Request Older History
+                      </button>
+                    )}
+                    {historyStatus[group.id] && (
+                      <p style={{ color: 'var(--text-muted)', fontSize: '0.75rem', lineHeight: 1.45, marginTop: '8px' }}>
+                        {historyStatus[group.id]}
+                      </p>
+                    )}
+                  </div>
                   
                   {/* Schema selector */}
                   <div>
@@ -75,7 +112,7 @@ export default function GroupsTab({ groups, schemas, onUpdateGroup, onSyncGroups
                     <select
                       className="input-field"
                       value={group.active_schema_id || 'default'}
-                      onChange={(e) => onUpdateGroup(group.id, isMonitored, e.target.value)}
+                      onChange={(e) => onUpdateGroup(group.id, isMonitored, e.target.value, oracleSyncEnabled, supplierCode, supplierSenderIds)}
                     >
                       {schemas.map(s => (
                         <option key={s.id} value={s.id}>{s.name} ({s.id})</option>
@@ -83,11 +120,55 @@ export default function GroupsTab({ groups, schemas, onUpdateGroup, onSyncGroups
                     </select>
                   </div>
 
+                  <div style={{ padding: '14px', borderRadius: '12px', background: 'rgba(6, 182, 212, 0.07)', border: '1px solid rgba(6, 182, 212, 0.18)' }}>
+                    <label style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase', display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
+                      <Database size={14} /> Oracle supplier mapping
+                    </label>
+                    <select
+                      className="input-field"
+                      value={supplierCode}
+                      onChange={(event) => onUpdateGroup(group.id, isMonitored, group.active_schema_id, oracleSyncEnabled && Boolean(event.target.value), event.target.value, supplierSenderIds)}
+                    >
+                      <option value="">Select supplier for this group</option>
+                      {oracleSuppliers.map(supplier => (
+                        <option key={supplier.id || supplier.code} value={supplier.code}>{supplier.name} ({supplier.code})</option>
+                      ))}
+                    </select>
+                    <label style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block', margin: '10px 0 6px' }}>
+                      Supplier sender IDs
+                    </label>
+                    <input
+                      className="input-field"
+                      key={`${group.id}:${supplierSenderIds}`}
+                      defaultValue={supplierSenderIds}
+                      placeholder="6587540420@s.whatsapp.net, 12345@lid"
+                      onBlur={(event) => onUpdateGroup(
+                        group.id,
+                        isMonitored,
+                        group.active_schema_id,
+                        oracleSyncEnabled,
+                        supplierCode,
+                        event.target.value
+                      )}
+                    />
+                    <button
+                      className={oracleSyncEnabled ? 'btn btn-danger' : 'btn btn-secondary'}
+                      style={{ width: '100%', marginTop: '10px' }}
+                      disabled={!oracleSyncEnabled && (!supplierCode || !supplierSenderIds.trim())}
+                      onClick={() => onUpdateGroup(group.id, oracleSyncEnabled ? isMonitored : true, group.active_schema_id, !oracleSyncEnabled, supplierCode, supplierSenderIds)}
+                    >
+                      {oracleSyncEnabled ? 'Pause Quotation Sync' : 'Enable Quotation Sync'}
+                    </button>
+                    <p style={{ color: 'var(--text-dim)', fontSize: '0.75rem', lineHeight: 1.45, marginTop: '8px' }}>
+                      Off by default. Only settled, complete tyre quotations sent by these supplier identities enter the Oracle review queue.
+                    </p>
+                  </div>
+
                   {/* Toggle button */}
                   <button
                     className={isMonitored ? 'btn btn-danger' : 'btn btn-primary'}
                     style={{ width: '100%' }}
-                    onClick={() => onUpdateGroup(group.id, !isMonitored, group.active_schema_id)}
+                    onClick={() => onUpdateGroup(group.id, !isMonitored, group.active_schema_id, !isMonitored && oracleSyncEnabled, supplierCode, supplierSenderIds)}
                   >
                     {isMonitored ? 'Disable Monitoring' : 'Enable Real-time Monitoring'}
                   </button>

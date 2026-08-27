@@ -1,7 +1,7 @@
 import React, { useRef, useEffect } from 'react';
-import { Activity, Terminal, MessageSquare, Cpu, Image as ImageIcon, FileText } from 'lucide-react';
+import { Activity, Terminal, MessageSquare, Image as ImageIcon, FileText } from 'lucide-react';
 
-export default function LiveFeedTab({ liveFeed, logs }) {
+export default function LiveFeedTab({ liveMessages, logs }) {
   const logEndRef = useRef(null);
 
   useEffect(() => {
@@ -11,56 +11,44 @@ export default function LiveFeedTab({ liveFeed, logs }) {
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))', gap: '20px' }}>
       
-      {/* Left Column: Live Extractions Feed */}
+      {/* Left Column: stored-message feed */}
       <div className="glass-panel" style={{ padding: '24px', display: 'flex', flexDirection: 'column', height: 'calc(100vh - 220px)', minHeight: '500px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '16px' }}>
           <Activity size={22} color="#25d366" />
-          <h2 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Real-Time LLM Extractions Stream</h2>
+          <h2 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Selected Chat Message Stream</h2>
         </div>
 
         <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '16px', paddingRight: '6px' }}>
-          {liveFeed.length === 0 ? (
+          {liveMessages.length === 0 ? (
             <div style={{ textAlign: 'center', margin: 'auto', color: 'var(--text-muted)' }}>
               <MessageSquare size={36} color="var(--text-dim)" style={{ marginBottom: '8px' }} />
-              <p>Waiting for incoming group chat messages...</p>
+              <p>Waiting for messages from a selected group or DM...</p>
             </div>
           ) : (
-            liveFeed.map((item, idx) => (
-              <div key={idx} style={{ background: 'rgba(0,0,0,0.3)', border: '1px solid var(--border-color)', borderRadius: '12px', padding: '16px' }}>
+            liveMessages.map(message => (
+              <div key={message.wa_message_id || message.id} style={{ background: 'rgba(0,0,0,0.3)', border: '1px solid var(--border-color)', borderRadius: '12px', padding: '16px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '8px', marginBottom: '10px' }}>
                   <div>
-                    <span style={{ fontWeight: 600, color: '#ffffff' }}>{item.message?.sender_name || 'Sender'}</span>
+                    <span style={{ fontWeight: 600, color: '#ffffff' }}>{message.sender_name || 'Sender'}</span>
                     <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginLeft: '8px' }}>
-                      in {item.message?.group_name || item.group_id}
+                      in {message.group_name || message.group_id}
                     </span>
                   </div>
-                  <span className={item.extraction_status === 'success' ? 'badge badge-success' : 'badge badge-danger'}>
-                    <Cpu size={12} /> {item.llm_provider}/{item.llm_model}
-                  </span>
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    <span className="badge badge-info">{message.chat_type === 'dm' ? 'DM' : 'Group'}</span>
+                    <span className="badge badge-warning" style={{ textTransform: 'capitalize' }}>{message.source || 'realtime'}</span>
+                  </div>
                 </div>
 
-                {/* Raw message text or media badge */}
-                <div style={{ background: 'rgba(255,255,255,0.04)', padding: '10px 12px', borderRadius: '8px', fontSize: '0.88rem', marginBottom: '12px' }}>
-                  {item.message?.media_path && (
+                <div style={{ background: 'rgba(255,255,255,0.04)', padding: '10px 12px', borderRadius: '8px', fontSize: '0.88rem' }}>
+                  {message.media_path && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.75rem', color: '#38bdf8', marginBottom: '4px' }}>
-                      {item.message?.message_type === 'imageMessage' ? <ImageIcon size={14} /> : <FileText size={14} />}
-                      Media Attachment: {item.message?.media_path}
+                      {message.message_type === 'imageMessage' ? <ImageIcon size={14} /> : <FileText size={14} />}
+                      Media Attachment: {message.media_path}
                     </div>
                   )}
-                  "{item.message?.content}"
+                  &quot;{message.content}&quot;
                 </div>
-
-                {/* Extracted JSON */}
-                {item.extracted_data && (
-                  <div style={{ background: '#090d16', padding: '12px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)', fontSize: '0.82rem', fontFamily: 'var(--font-mono)' }}>
-                    <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '6px' }}>
-                      Schema: {item.schema_id}
-                    </div>
-                    <pre style={{ color: '#4ade80', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
-                      {JSON.stringify(item.extracted_data, null, 2)}
-                    </pre>
-                  </div>
-                )}
               </div>
             ))
           )}

@@ -21,10 +21,31 @@ export function initDatabase() {
     CREATE TABLE IF NOT EXISTS groups (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
-      is_monitored INTEGER DEFAULT 1,
+      is_monitored INTEGER DEFAULT 0,
       active_schema_id TEXT DEFAULT 'default',
+      oracle_sync_enabled INTEGER DEFAULT 0,
+      oracle_supplier_code TEXT,
+      oracle_supplier_sender_ids TEXT,
+      account_id TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS dm_chats (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      phone_jid TEXT,
+      lid_jid TEXT,
+      account_id TEXT,
+      is_monitored INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS dm_aliases (
+      alias_jid TEXT PRIMARY KEY,
+      dm_id TEXT NOT NULL,
+      FOREIGN KEY (dm_id) REFERENCES dm_chats (id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS schemas (
@@ -50,6 +71,9 @@ export function initDatabase() {
       media_path TEXT,
       media_mime TEXT,
       raw_json TEXT,
+      source TEXT NOT NULL DEFAULT 'realtime',
+      chat_type TEXT NOT NULL DEFAULT 'group',
+      account_id TEXT,
       timestamp TEXT NOT NULL
     );
 
@@ -71,6 +95,108 @@ export function initDatabase() {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS oracle_sync_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id INTEGER NOT NULL,
+      group_id TEXT NOT NULL,
+      supplier_code TEXT NOT NULL,
+      supplier_name TEXT,
+      payload_hash TEXT UNIQUE NOT NULL,
+      listing_status TEXT NOT NULL,
+      sync_status TEXT NOT NULL,
+      brand TEXT NOT NULL,
+      model TEXT NOT NULL,
+      size TEXT NOT NULL,
+      price REAL NOT NULL,
+      year_of_manufacture INTEGER,
+      country_of_origin TEXT,
+      quoted_at TEXT NOT NULL,
+      confidence REAL,
+      stock_quantity INTEGER,
+      availability TEXT,
+      match_type TEXT,
+      source_message_ids TEXT,
+      oracle_price_id TEXT,
+      request_payload TEXT NOT NULL,
+      response_json TEXT,
+      error_message TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (message_id) REFERENCES messages (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS oracle_quote_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_id TEXT NOT NULL,
+      trigger_message_id INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      reason TEXT,
+      source_message_ids TEXT,
+      extraction_json TEXT,
+      event_count INTEGER DEFAULT 0,
+      error_message TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (trigger_message_id) REFERENCES messages (id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_oracle_sync_events_created
+      ON oracle_sync_events (created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_oracle_sync_events_group
+      ON oracle_sync_events (group_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_oracle_quote_runs_group
+      ON oracle_quote_runs (group_id, created_at DESC);
+  `);
+
+  // Keep older local databases compatible with the source marker.
+  const messageColumns = db.prepare('PRAGMA table_info(messages)').all();
+  if (!messageColumns.some(column => column.name === 'source')) {
+    db.exec("ALTER TABLE messages ADD COLUMN source TEXT NOT NULL DEFAULT 'realtime'");
+  }
+  if (!messageColumns.some(column => column.name === 'chat_type')) {
+    db.exec("ALTER TABLE messages ADD COLUMN chat_type TEXT NOT NULL DEFAULT 'group'");
+  }
+  if (!messageColumns.some(column => column.name === 'account_id')) {
+    db.exec('ALTER TABLE messages ADD COLUMN account_id TEXT');
+  }
+
+  const dmColumns = db.prepare('PRAGMA table_info(dm_chats)').all();
+  if (!dmColumns.some(column => column.name === 'account_id')) {
+    db.exec('ALTER TABLE dm_chats ADD COLUMN account_id TEXT');
+  }
+
+  const groupColumns = db.prepare('PRAGMA table_info(groups)').all();
+  if (!groupColumns.some(column => column.name === 'oracle_sync_enabled')) {
+    db.exec('ALTER TABLE groups ADD COLUMN oracle_sync_enabled INTEGER DEFAULT 0');
+  }
+  if (!groupColumns.some(column => column.name === 'oracle_supplier_code')) {
+    db.exec('ALTER TABLE groups ADD COLUMN oracle_supplier_code TEXT');
+  }
+  if (!groupColumns.some(column => column.name === 'oracle_supplier_sender_ids')) {
+    db.exec('ALTER TABLE groups ADD COLUMN oracle_supplier_sender_ids TEXT');
+  }
+  if (!groupColumns.some(column => column.name === 'account_id')) {
+    db.exec('ALTER TABLE groups ADD COLUMN account_id TEXT');
+  }
+
+  const oracleEventColumns = db.prepare('PRAGMA table_info(oracle_sync_events)').all();
+  for (const [name, type] of [
+    ['stock_quantity', 'INTEGER'],
+    ['availability', 'TEXT'],
+    ['match_type', 'TEXT'],
+    ['source_message_ids', 'TEXT']
+  ]) {
+    if (!oracleEventColumns.some(column => column.name === name)) {
+      db.exec(`ALTER TABLE oracle_sync_events ADD COLUMN ${name} ${type}`);
+    }
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_account_timestamp
+      ON messages (account_id, timestamp DESC);
+    CREATE INDEX IF NOT EXISTS idx_dm_chats_account
+      ON dm_chats (account_id, updated_at DESC);
   `);
 
   seedDefaultSchemas();
@@ -144,15 +270,20 @@ function seedDefaultSchemas() {
 }
 
 function seedDefaultSettings() {
+  const environmentOnlyApiKeys = process.env.ENV_ONLY_API_KEYS === 'true';
   const defaults = {
     llm_provider: process.env.DEFAULT_LLM_PROVIDER || 'gemini',
     llm_model: process.env.DEFAULT_LLM_MODEL || 'gemini-2.0-flash',
-    openai_api_key: process.env.OPENAI_API_KEY || '',
-    gemini_api_key: process.env.GEMINI_API_KEY || '',
-    anthropic_api_key: process.env.ANTHROPIC_API_KEY || '',
+    openai_api_key: environmentOnlyApiKeys ? '' : process.env.OPENAI_API_KEY || '',
+    gemini_api_key: environmentOnlyApiKeys ? '' : process.env.GEMINI_API_KEY || '',
+    anthropic_api_key: environmentOnlyApiKeys ? '' : process.env.ANTHROPIC_API_KEY || '',
     ollama_base_url: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
     auto_download_media: 'true',
-    extract_document_text: 'true'
+    extract_document_text: 'true',
+    oracle_auto_publish: 'false',
+    oracle_context_messages: '30',
+    oracle_context_minutes: '15',
+    oracle_quiet_period_seconds: '45'
   };
 
   const check = db.prepare('SELECT key FROM settings WHERE key = ?');
@@ -166,29 +297,188 @@ function seedDefaultSettings() {
 }
 
 // Group helpers
-export function upsertGroup(id, name) {
+export function upsertGroup(id, name, accountId = null) {
   const existing = db.prepare('SELECT id, is_monitored, active_schema_id FROM groups WHERE id = ?').get(id);
   if (existing) {
-    db.prepare('UPDATE groups SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(name, id);
+    db.prepare('UPDATE groups SET name = ?, account_id = COALESCE(?, account_id), updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(name, accountId, id);
     return existing;
   } else {
-    db.prepare("INSERT INTO groups (id, name, is_monitored, active_schema_id) VALUES (?, ?, 1, 'default')").run(id, name);
-    return { id, name, is_monitored: 1, active_schema_id: 'default' };
+    db.prepare("INSERT INTO groups (id, name, is_monitored, active_schema_id, account_id) VALUES (?, ?, 0, 'default', ?)").run(id, name, accountId);
+    return { id, name, is_monitored: 0, active_schema_id: 'default', account_id: accountId };
   }
 }
 
 export function getGroups() {
-  return db.prepare('SELECT * FROM groups ORDER BY updated_at DESC').all();
+  const activeAccount = getActiveWhatsappAccount();
+  if (activeAccount) {
+    return db.prepare(`
+      SELECT g.*,
+        COUNT(m.id) AS message_count,
+        MIN(m.timestamp) AS first_message_at,
+        MAX(m.timestamp) AS last_message_at
+      FROM groups g
+      LEFT JOIN messages m
+        ON m.group_id = g.id
+        AND m.chat_type = 'group'
+        AND m.account_id = g.account_id
+      WHERE g.account_id = ?
+      GROUP BY g.id
+      ORDER BY g.updated_at DESC
+    `).all(activeAccount);
+  }
+  return db.prepare(`
+    SELECT g.*,
+      COUNT(m.id) AS message_count,
+      MIN(m.timestamp) AS first_message_at,
+      MAX(m.timestamp) AS last_message_at
+    FROM groups g
+    LEFT JOIN messages m ON m.group_id = g.id AND m.chat_type = 'group'
+    GROUP BY g.id
+    ORDER BY g.updated_at DESC
+  `).all();
 }
 
-export function setGroupMonitoring(id, isMonitored, activeSchemaId = null) {
-  if (activeSchemaId) {
-    db.prepare('UPDATE groups SET is_monitored = ?, active_schema_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-      .run(isMonitored ? 1 : 0, activeSchemaId, id);
-  } else {
-    db.prepare('UPDATE groups SET is_monitored = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-      .run(isMonitored ? 1 : 0, id);
+export function getActiveWhatsappAccount() {
+  return db.prepare("SELECT value FROM settings WHERE key = 'whatsapp_account_id'").get()?.value || null;
+}
+
+export function setActiveWhatsappAccount(accountId) {
+  const normalized = String(accountId || '').trim();
+  if (!normalized) return false;
+  const current = db.prepare("SELECT value FROM settings WHERE key = 'whatsapp_account_id'").get()?.value;
+  if (current === normalized) return false;
+
+  db.transaction(() => {
+    db.prepare('UPDATE groups SET is_monitored = 0, oracle_sync_enabled = 0, updated_at = CURRENT_TIMESTAMP').run();
+    db.prepare('UPDATE dm_chats SET is_monitored = 0, updated_at = CURRENT_TIMESTAMP').run();
+    db.prepare(`
+      INSERT INTO settings (key, value) VALUES ('whatsapp_account_id', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(normalized);
+  })();
+  return true;
+}
+
+export function setGroupMonitoring(
+  id,
+  isMonitored,
+  activeSchemaId = null,
+  oracleSyncEnabled = false,
+  oracleSupplierCode = null,
+  oracleSupplierSenderIds = null
+) {
+  db.prepare(`
+    UPDATE groups SET
+      is_monitored = ?,
+      active_schema_id = COALESCE(?, active_schema_id),
+      oracle_sync_enabled = ?,
+      oracle_supplier_code = ?,
+      oracle_supplier_sender_ids = ?,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(
+    isMonitored ? 1 : 0,
+    activeSchemaId || null,
+    oracleSyncEnabled ? 1 : 0,
+    oracleSupplierCode || null,
+    oracleSupplierSenderIds || null,
+    id
+  );
+}
+
+// Direct-message helpers. Aliases let the same conversation match either its
+// phone-number JID (@s.whatsapp.net) or privacy-preserving LID (@lid).
+export function upsertDmChat({ id, name, phoneJid = null, lidJid = null, accountId = getActiveWhatsappAccount() }) {
+  const aliases = [...new Set([id, phoneJid, lidJid].filter(Boolean))];
+  const matches = [];
+
+  for (const alias of aliases) {
+    const match = db.prepare(`
+      SELECT d.* FROM dm_chats d
+      LEFT JOIN dm_aliases a ON a.dm_id = d.id
+      WHERE (d.id = ? OR a.alias_jid = ?)
+        AND (? IS NULL OR d.account_id = ?)
+      LIMIT 1
+    `).get(alias, alias, accountId, accountId);
+    if (match && !matches.some(existingMatch => existingMatch.id === match.id)) matches.push(match);
   }
+
+  const existing = matches.find(match => match.is_monitored === 1)
+    || matches.find(match => phoneJid && match.id === phoneJid)
+    || matches[0]
+    || null;
+  const dmId = existing?.id || phoneJid || id || lidJid;
+  if (!dmId) return null;
+
+  const fallbackName = dmId.split('@')[0];
+  const resolvedName = name && name !== id && name !== phoneJid && name !== lidJid
+    ? name
+    : existing?.name || fallbackName;
+
+  db.prepare(`
+    INSERT INTO dm_chats (id, name, phone_jid, lid_jid, account_id, is_monitored)
+    VALUES (?, ?, ?, ?, ?, 0)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      phone_jid = COALESCE(excluded.phone_jid, dm_chats.phone_jid),
+      lid_jid = COALESCE(excluded.lid_jid, dm_chats.lid_jid),
+      account_id = COALESCE(excluded.account_id, dm_chats.account_id),
+      updated_at = CURRENT_TIMESTAMP
+  `).run(dmId, resolvedName, phoneJid, lidJid, accountId);
+
+  // A phone JID and LID can arrive in separate sync chunks. Once WhatsApp
+  // supplies their relationship, collapse any duplicate chat rows without
+  // losing monitoring state or already stored messages.
+  for (const duplicate of matches.filter(match => match.id !== dmId)) {
+    db.prepare("UPDATE messages SET group_id = ? WHERE group_id = ? AND chat_type = 'dm'").run(dmId, duplicate.id);
+    db.prepare('UPDATE dm_aliases SET dm_id = ? WHERE dm_id = ?').run(dmId, duplicate.id);
+    if (duplicate.is_monitored === 1) {
+      db.prepare('UPDATE dm_chats SET is_monitored = 1 WHERE id = ?').run(dmId);
+    }
+    db.prepare('DELETE FROM dm_chats WHERE id = ?').run(duplicate.id);
+  }
+
+  const aliasStmt = db.prepare(`
+    INSERT INTO dm_aliases (alias_jid, dm_id) VALUES (?, ?)
+    ON CONFLICT(alias_jid) DO UPDATE SET dm_id = excluded.dm_id
+  `);
+  for (const alias of [...new Set([dmId, ...aliases])]) {
+    aliasStmt.run(alias, dmId);
+  }
+
+  return db.prepare('SELECT * FROM dm_chats WHERE id = ?').get(dmId);
+}
+
+export function findDmChatByJid(jid) {
+  const activeAccount = getActiveWhatsappAccount();
+  return db.prepare(`
+    SELECT d.* FROM dm_chats d
+    LEFT JOIN dm_aliases a ON a.dm_id = d.id
+    WHERE (d.id = ? OR a.alias_jid = ?)
+      AND (? IS NULL OR d.account_id = ?)
+    LIMIT 1
+  `).get(jid, jid, activeAccount, activeAccount);
+}
+
+export function getDmChats() {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return [];
+  return db.prepare(`
+    SELECT d.*, COUNT(m.id) AS message_count, MAX(m.timestamp) AS last_message_at
+    FROM dm_chats d
+    LEFT JOIN messages m
+      ON m.group_id = d.id
+      AND m.chat_type = 'dm'
+      AND m.account_id = d.account_id
+    WHERE d.account_id = ?
+    GROUP BY d.id
+    ORDER BY d.is_monitored DESC, COALESCE(last_message_at, d.updated_at) DESC, d.name COLLATE NOCASE
+  `).all(activeAccount);
+}
+
+export function setDmMonitoring(id, isMonitored) {
+  db.prepare('UPDATE dm_chats SET is_monitored = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    .run(isMonitored ? 1 : 0, id);
 }
 
 // Schema helpers
@@ -221,8 +511,8 @@ export function deleteSchema(id) {
 // Message & Extraction helpers
 export function saveMessage(msg) {
   const stmt = db.prepare(`
-    INSERT INTO messages (wa_message_id, group_id, group_name, sender_id, sender_name, message_type, content, extracted_text, media_path, media_mime, raw_json, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO messages (wa_message_id, group_id, group_name, sender_id, sender_name, message_type, content, extracted_text, media_path, media_mime, raw_json, source, chat_type, account_id, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const result = stmt.run(
     msg.wa_message_id,
@@ -236,9 +526,15 @@ export function saveMessage(msg) {
     msg.media_path || null,
     msg.media_mime || null,
     msg.raw_json ? JSON.stringify(msg.raw_json) : null,
+    msg.source || 'realtime',
+    msg.chat_type || 'group',
+    msg.account_id || getActiveWhatsappAccount(),
     msg.timestamp
   );
-  return result.lastInsertRowid;
+  if (result.changes === 0) {
+    return db.prepare('SELECT id FROM messages WHERE wa_message_id = ?').get(msg.wa_message_id)?.id || null;
+  }
+  return Number(result.lastInsertRowid);
 }
 
 export function saveExtraction(ext) {
@@ -259,6 +555,185 @@ export function saveExtraction(ext) {
   return result.lastInsertRowid;
 }
 
+export function getRecentGroupMessages(groupId, limit = 12) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 12, 50));
+  const activeAccount = getActiveWhatsappAccount();
+  return db.prepare(`
+    SELECT id, wa_message_id, group_id, sender_id, sender_name, content, extracted_text, timestamp
+    FROM messages
+    WHERE group_id = ? AND chat_type = 'group'
+      AND (? IS NULL OR account_id = ?)
+    ORDER BY timestamp DESC, id DESC
+    LIMIT ?
+  `).all(groupId, activeAccount, activeAccount, safeLimit);
+}
+
+export function getGroupMessagesEndingAt(groupId, currentMessageId, limit = 12) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 12, 50));
+  const activeAccount = getActiveWhatsappAccount();
+  const current = db.prepare(`
+    SELECT id, timestamp
+    FROM messages
+    WHERE id = ? AND group_id = ? AND chat_type = 'group'
+      AND (? IS NULL OR account_id = ?)
+  `).get(currentMessageId, groupId, activeAccount, activeAccount);
+  if (!current) return [];
+
+  return db.prepare(`
+    SELECT id, wa_message_id, group_id, sender_id, sender_name, content, extracted_text, timestamp
+    FROM messages
+    WHERE group_id = ? AND chat_type = 'group'
+      AND (? IS NULL OR account_id = ?)
+      AND (timestamp < ? OR (timestamp = ? AND id <= ?))
+    ORDER BY timestamp DESC, id DESC
+    LIMIT ?
+  `).all(
+    groupId,
+    activeAccount,
+    activeAccount,
+    current.timestamp,
+    current.timestamp,
+    current.id,
+    safeLimit
+  );
+}
+
+export function createOracleSyncEvent(event) {
+  const stmt = db.prepare(`
+    INSERT OR IGNORE INTO oracle_sync_events (
+      message_id, group_id, supplier_code, supplier_name, payload_hash,
+      listing_status, sync_status, brand, model, size, price,
+      year_of_manufacture, country_of_origin, quoted_at, confidence,
+      stock_quantity, availability, match_type, source_message_ids,
+      request_payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const result = stmt.run(
+    event.message_id,
+    event.group_id,
+    event.supplier_code,
+    event.supplier_name || null,
+    event.payload_hash,
+    event.listing_status,
+    event.sync_status,
+    event.brand,
+    event.model,
+    event.size,
+    event.price,
+    event.year_of_manufacture || null,
+    event.country_of_origin || null,
+    event.quoted_at,
+    event.confidence || null,
+    event.stock_quantity || null,
+    event.availability || null,
+    event.match_type || null,
+    event.source_message_ids ? JSON.stringify(event.source_message_ids) : null,
+    event.request_payload
+  );
+  if (result.changes === 0) return null;
+  return getOracleSyncEventById(Number(result.lastInsertRowid));
+}
+
+export function createOracleQuoteRun(run) {
+  const result = db.prepare(`
+    INSERT INTO oracle_quote_runs (
+      group_id, trigger_message_id, status, reason, source_message_ids,
+      extraction_json, event_count, error_message
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    run.group_id,
+    run.trigger_message_id,
+    run.status,
+    run.reason || null,
+    run.source_message_ids ? JSON.stringify(run.source_message_ids) : null,
+    run.extraction_json ? JSON.stringify(run.extraction_json) : null,
+    Number(run.event_count) || 0,
+    run.error_message || null
+  );
+  return getOracleQuoteRunById(Number(result.lastInsertRowid));
+}
+
+export function getOracleQuoteRunById(id) {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return null;
+  return db.prepare(`
+    SELECT r.*, g.name AS group_name
+    FROM oracle_quote_runs r
+    LEFT JOIN groups g ON g.id = r.group_id
+    INNER JOIN messages m ON m.id = r.trigger_message_id AND m.account_id = ?
+    WHERE r.id = ?
+  `).get(activeAccount, id);
+}
+
+export function updateOracleQuoteRun(id, changes) {
+  const allowed = ['status', 'reason', 'source_message_ids', 'extraction_json', 'event_count', 'error_message'];
+  const entries = Object.entries(changes).filter(([key]) => allowed.includes(key));
+  if (entries.length === 0) return getOracleQuoteRunById(id);
+  const serialized = entries.map(([key, value]) => [
+    key,
+    ['source_message_ids', 'extraction_json'].includes(key) && value != null ? JSON.stringify(value) : value
+  ]);
+  const assignments = serialized.map(([key]) => `${key} = ?`).join(', ');
+  db.prepare(`UPDATE oracle_quote_runs SET ${assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+    .run(...serialized.map(([, value]) => value ?? null), id);
+  return getOracleQuoteRunById(id);
+}
+
+export function getOracleQuoteRuns(limit = 100) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return [];
+  return db.prepare(`
+    SELECT r.*, g.name AS group_name
+    FROM oracle_quote_runs r
+    LEFT JOIN groups g ON g.id = r.group_id
+    INNER JOIN messages m ON m.id = r.trigger_message_id AND m.account_id = ?
+    ORDER BY r.created_at DESC, r.id DESC
+    LIMIT ?
+  `).all(activeAccount, safeLimit);
+}
+
+export function getOracleSyncEventById(id) {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return null;
+  return db.prepare(`
+    SELECT e.*, g.name AS group_name
+    FROM oracle_sync_events e
+    LEFT JOIN groups g ON g.id = e.group_id
+    INNER JOIN messages m ON m.id = e.message_id AND m.account_id = ?
+    WHERE e.id = ?
+  `).get(activeAccount, id);
+}
+
+export function updateOracleSyncEvent(id, changes) {
+  const allowed = [
+    'sync_status',
+    'oracle_price_id',
+    'response_json',
+    'error_message'
+  ];
+  const entries = Object.entries(changes).filter(([key]) => allowed.includes(key));
+  if (entries.length === 0) return getOracleSyncEventById(id);
+  const assignments = entries.map(([key]) => `${key} = ?`).join(', ');
+  db.prepare(`UPDATE oracle_sync_events SET ${assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+    .run(...entries.map(([, value]) => value ?? null), id);
+  return getOracleSyncEventById(id);
+}
+
+export function getOracleSyncEvents(limit = 100) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return [];
+  return db.prepare(`
+    SELECT e.*, g.name AS group_name
+    FROM oracle_sync_events e
+    LEFT JOIN groups g ON g.id = e.group_id
+    INNER JOIN messages m ON m.id = e.message_id AND m.account_id = ?
+    ORDER BY e.created_at DESC, e.id DESC
+    LIMIT ?
+  `).all(activeAccount, safeLimit);
+}
+
 export function getMessagesWithExtractions({ groupId = null, limit = 50, offset = 0, search = '' }) {
   let query = `
     SELECT 
@@ -276,6 +751,11 @@ export function getMessagesWithExtractions({ groupId = null, limit = 50, offset 
     WHERE 1=1
   `;
   const params = [];
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return [];
+
+  query += ' AND m.account_id = ?';
+  params.push(activeAccount);
 
   if (groupId) {
     query += ' AND m.group_id = ?';
@@ -288,19 +768,29 @@ export function getMessagesWithExtractions({ groupId = null, limit = 50, offset 
     params.push(term, term, term, term);
   }
 
-  query += ' ORDER BY m.id DESC LIMIT ? OFFSET ?';
+  query += ' ORDER BY m.timestamp DESC, m.id DESC LIMIT ? OFFSET ?';
   params.push(limit, offset);
 
-  return db.prepare(query).all();
+  return db.prepare(query).all(...params);
 }
 
 export function getStats() {
-  const totalMessages = db.prepare('SELECT COUNT(*) as count FROM messages').get().count;
-  const totalExtractions = db.prepare("SELECT COUNT(*) as count FROM extractions WHERE status = 'success'").get().count;
-  const activeGroups = db.prepare('SELECT COUNT(*) as count FROM groups WHERE is_monitored = 1').get().count;
-  const mediaCount = db.prepare('SELECT COUNT(*) as count FROM messages WHERE media_path IS NOT NULL').get().count;
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) {
+    return { totalMessages: 0, totalExtractions: 0, activeGroups: 0, activeDms: 0, mediaCount: 0 };
+  }
+  const totalMessages = db.prepare('SELECT COUNT(*) as count FROM messages WHERE account_id = ?').get(activeAccount).count;
+  const totalExtractions = db.prepare(`
+    SELECT COUNT(*) as count
+    FROM extractions e
+    INNER JOIN messages m ON m.id = e.message_id
+    WHERE e.status = 'success' AND m.account_id = ?
+  `).get(activeAccount).count;
+  const activeGroups = db.prepare('SELECT COUNT(*) as count FROM groups WHERE is_monitored = 1 AND account_id = ?').get(activeAccount).count;
+  const activeDms = db.prepare('SELECT COUNT(*) as count FROM dm_chats WHERE is_monitored = 1 AND account_id = ?').get(activeAccount).count;
+  const mediaCount = db.prepare('SELECT COUNT(*) as count FROM messages WHERE media_path IS NOT NULL AND account_id = ?').get(activeAccount).count;
 
-  return { totalMessages, totalExtractions, activeGroups, mediaCount };
+  return { totalMessages, totalExtractions, activeGroups, activeDms, mediaCount };
 }
 
 // Settings helpers

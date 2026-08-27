@@ -179,6 +179,20 @@ textarea.input-field {
   line-height: 1.5;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  transform: none !important;
+}
+
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
 /* Modal Overlay */
 .modal-overlay {
   position: fixed;

@@ -1,0 +1,633 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Dedicated private singleton deployment for the Hi-Lite WhatsApp listener.
+  Reuses the production VPC and HTTPS ALB, protects the dashboard with Cognito,
+  and retains encrypted session data independently of the EC2 instance.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0ae5421f0f4a9a4c2
+  PrivateSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-02ada20ad676b76b9
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: ap-southeast-1b
+  AlbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Default: sg-0f0a859b33624b3b5
+  HttpsListenerArn:
+    Type: String
+    Default: arn:aws:elasticloadbalancing:ap-southeast-1:824865425772:listener/app/hilite-prod-alb/2d63bf98b336f37f/5393aa348e383516
+  WorkloadKmsKeyArn:
+    Type: String
+    Default: arn:aws:kms:ap-southeast-1:824865425772:key/2d489a9b-b420-466c-8d02-a81111386b6a
+  ArtifactBucketName:
+    Type: String
+    Default: hilite-prod-deploy-artifacts-824865425772-ap-southeast-1
+  DashboardDomain:
+    Type: String
+    Default: whatsapp.hilitedigi.ai
+  ListenerRulePriority:
+    Type: Number
+    Default: 65
+    MinValue: 1
+    MaxValue: 50000
+  InstanceType:
+    Type: String
+    Default: t4g.medium
+    AllowedValues:
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+  DataVolumeSize:
+    Type: Number
+    Default: 30
+    MinValue: 20
+    MaxValue: 500
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  SourceArchiveUri:
+    Type: String
+    Default: s3://hilite-prod-deploy-artifacts-824865425772-ap-southeast-1/whatsapp-listener/source/pending/source.tgz
+  ImageTag:
+    Type: String
+    Default: pending
+
+Resources:
+  ListenerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /hilite/prod/whatsapp-listener
+      KmsKeyId: !Ref WorkloadKmsKeyArn
+      RetentionInDays: 365
+
+  ListenerSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: hilite/prod/whatsapp-listener
+      Description: Rotated provider credentials for the dedicated WhatsApp listener
+      KmsKeyId: !Ref WorkloadKmsKeyArn
+      GenerateSecretString:
+        SecretStringTemplate: '{"OPENAI_API_KEY":"","GEMINI_API_KEY":"","ANTHROPIC_API_KEY":"","ORACLE_API_TOKEN":""}'
+        GenerateStringKey: _bootstrap
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - Key: Environment
+          Value: production
+        - Key: Service
+          Value: whatsapp-listener
+
+  ListenerRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: hilite/whatsapp-listener
+      ImageTagMutability: IMMUTABLE
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !Ref WorkloadKmsKeyArn
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: >-
+          {"rules":[{"rulePriority":1,"description":"Retain the newest 20 releases","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":20},"action":{"type":"expire"}}]}
+      Tags:
+        - Key: Environment
+          Value: production
+        - Key: Service
+          Value: whatsapp-listener
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: hilite-prod-whatsapp-listener-build
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BuildAndPublishListenerImage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${ListenerLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/whatsapp-listener/source/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !Ref WorkloadKmsKeyArn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt ListenerRepository.Arn
+
+  ImageBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: hilite-prod-whatsapp-listener-image
+      Description: Builds the reviewed ARM64 WhatsApp listener image once and publishes it to ECR
+      ServiceRole: !GetAtt BuildRole.Arn
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - test -n "$SOURCE_S3_URI"
+                - test -n "$IMAGE_TAG"
+                - mkdir -p /tmp/listener-source
+                - aws s3 cp "$SOURCE_S3_URI" /tmp/listener-source.tgz
+                - tar -xzf /tmp/listener-source.tgz -C /tmp/listener-source
+                - REGISTRY_HOST=$(printf '%s' "$REPOSITORY_URI" | cut -d/ -f1)
+                - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_HOST"
+            build:
+              commands:
+                - cd /tmp/listener-source
+                - docker build --pull --label "org.opencontainers.image.revision=$IMAGE_TAG" -t "$REPOSITORY_URI:$IMAGE_TAG" .
+            post_build:
+              commands:
+                - docker push "$REPOSITORY_URI:$IMAGE_TAG"
+                - printf '{"image":"%s:%s"}\n' "$REPOSITORY_URI" "$IMAGE_TAG"
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Type: PLAINTEXT
+            Value: !GetAtt ListenerRepository.RepositoryUri
+          - Name: SOURCE_S3_URI
+            Type: PLAINTEXT
+            Value: !Ref SourceArchiveUri
+          - Name: IMAGE_TAG
+            Type: PLAINTEXT
+            Value: !Ref ImageTag
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref ListenerLogGroup
+          StreamName: image-build
+      TimeoutInMinutes: 30
+      QueuedTimeoutInMinutes: 30
+      BadgeEnabled: false
+      Tags:
+        - Key: Environment
+          Value: production
+        - Key: Service
+          Value: whatsapp-listener
+
+  ListenerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: hilite-prod-whatsapp-listener-instance
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ListenerRuntimeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref ListenerSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:GenerateDataKey
+                Resource: !Ref WorkloadKmsKeyArn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt ListenerRepository.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Resource: !Sub '${ListenerLogGroup.Arn}:*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}'
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - whatsapp-listener/backups/*
+                      - whatsapp-listener/deploy/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/whatsapp-listener/deploy/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucketName}/whatsapp-listener/backups/*'
+
+  ListenerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: hilite-prod-whatsapp-listener
+      Roles:
+        - !Ref ListenerInstanceRole
+
+  ListenerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Dedicated WhatsApp listener; inbound only from the production ALB
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Outbound HTTPS and AWS service access through the private subnet NAT path
+      Tags:
+        - Key: Name
+          Value: hilite-prod-whatsapp-listener-sg
+        - Key: Environment
+          Value: production
+
+  ListenerFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ListenerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref AlbSecurityGroupId
+      Description: Authenticated dashboard and health traffic from the ALB only
+
+  ListenerDataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Encrypted: true
+      KmsKeyId: !Ref WorkloadKmsKeyArn
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      Iops: 3000
+      Throughput: 125
+      Tags:
+        - Key: Name
+          Value: hilite-prod-whatsapp-listener-data
+        - Key: Environment
+          Value: production
+        - Key: Service
+          Value: whatsapp-listener
+        - Key: Backup
+          Value: daily
+
+  ListenerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PrivateSubnetId
+      SecurityGroupIds:
+        - !Ref ListenerSecurityGroup
+      IamInstanceProfile: !Ref ListenerInstanceProfile
+      DisableApiTermination: true
+      EbsOptimized: true
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        InstanceMetadataTags: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            KmsKeyId: !Ref WorkloadKmsKeyArn
+            VolumeSize: 20
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          dnf install -y docker jq xfsprogs
+          systemctl enable --now docker amazon-ssm-agent
+          mkdir -p /opt/mrrjestic-whatsapp-listener /var/lib/mrrjestic /run/mrrjestic
+          chmod 700 /run/mrrjestic
+          cat > /usr/local/sbin/mrrjestic-mount-data <<'MOUNT_SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          wanted_serial='${ListenerDataVolume}'
+          wanted_serial=$(printf '%s' "$wanted_serial" | tr -d '-')
+          data_device=''
+          for attempt in $(seq 1 120); do
+            data_device=$(lsblk -ndo PATH,SERIAL | awk -v serial="$wanted_serial" '$2 == serial {print $1; exit}')
+            if [ -n "$data_device" ]; then break; fi
+            sleep 5
+          done
+          test -n "$data_device"
+          if ! blkid "$data_device" >/dev/null 2>&1; then
+            mkfs.xfs -L MRRJESTIC_DATA "$data_device"
+          fi
+          if ! grep -q '^LABEL=MRRJESTIC_DATA ' /etc/fstab; then
+            printf 'LABEL=MRRJESTIC_DATA /var/lib/mrrjestic xfs defaults,nofail 0 2\n' >> /etc/fstab
+          fi
+          mountpoint -q /var/lib/mrrjestic || mount /var/lib/mrrjestic
+          mkdir -p /var/lib/mrrjestic/auth /var/lib/mrrjestic/data /var/lib/mrrjestic/media /var/lib/mrrjestic/backups
+          chown -R 1000:1000 /var/lib/mrrjestic
+          chmod 700 /var/lib/mrrjestic/auth /var/lib/mrrjestic/backups
+          MOUNT_SCRIPT
+          chmod 750 /usr/local/sbin/mrrjestic-mount-data
+          cat > /etc/systemd/system/mrrjestic-data.service <<'DATA_UNIT'
+          [Unit]
+          Description=Mount persistent Mrrjestic listener data
+          After=local-fs.target
+          Before=docker.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/mrrjestic-mount-data
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          DATA_UNIT
+          systemctl daemon-reload
+          systemctl enable --now mrrjestic-data.service
+      Tags:
+        - Key: Name
+          Value: hilite-prod-whatsapp-listener
+        - Key: Environment
+          Value: production
+        - Key: ManagedAccess
+          Value: SSMOnly
+        - Key: Service
+          Value: whatsapp-listener
+
+  ListenerVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref ListenerInstance
+      VolumeId: !Ref ListenerDataVolume
+
+  ListenerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: hilite-prod-whatsapp-tg
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 3000
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /health/live
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Targets:
+        - Id: !Ref ListenerInstance
+          Port: 3000
+      Tags:
+        - Key: Environment
+          Value: production
+        - Key: Service
+          Value: whatsapp-listener
+
+  DashboardUserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: hilite-prod-whatsapp-dashboard
+      DeletionProtection: ACTIVE
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 14
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+      UserPoolTags:
+        Environment: production
+        Service: whatsapp-listener
+
+  DashboardUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: hilite-prod-whatsapp-alb
+      UserPoolId: !Ref DashboardUserPool
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs:
+        - !Sub 'https://${DashboardDomain}/oauth2/idpresponse'
+      LogoutURLs:
+        - !Sub 'https://${DashboardDomain}/'
+      SupportedIdentityProviders:
+        - COGNITO
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  DashboardUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'hilite-whatsapp-${AWS::AccountId}'
+      UserPoolId: !Ref DashboardUserPool
+
+  DashboardListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListenerArn
+      Priority: !Ref ListenerRulePriority
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Ref DashboardDomain
+      Actions:
+        - Type: authenticate-cognito
+          Order: 1
+          AuthenticateCognitoConfig:
+            UserPoolArn: !GetAtt DashboardUserPool.Arn
+            UserPoolClientId: !Ref DashboardUserPoolClient
+            UserPoolDomain: !Ref DashboardUserPoolDomain
+            OnUnauthenticatedRequest: authenticate
+            Scope: openid email profile
+            SessionCookieName: AWSELBAuthSessionCookieWhatsApp
+            SessionTimeout: 3600
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !Ref ListenerTargetGroup
+
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BackupVaultName: hilite-prod-whatsapp-listener
+      EncryptionKeyArn: !Ref WorkloadKmsKeyArn
+      LockConfiguration:
+        MinRetentionDays: 14
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: hilite-prod-whatsapp-listener-backup
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: hilite-prod-whatsapp-listener-daily
+        BackupPlanRule:
+          - RuleName: daily-0315-sgt
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(15 19 * * ? *)
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 180
+            Lifecycle:
+              DeleteAfterDays: 14
+      BackupPlanTags:
+        Environment: production
+        Service: whatsapp-listener
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: whatsapp-listener-data-volume
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources:
+          - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/${ListenerDataVolume}'
+
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: hilite-prod-whatsapp-listener-instance-status
+      AlarmDescription: Dedicated WhatsApp listener EC2 instance status check failed
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ListenerInstance
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+
+Outputs:
+  InstanceId:
+    Value: !Ref ListenerInstance
+  DataVolumeId:
+    Value: !Ref ListenerDataVolume
+  TargetGroupArn:
+    Value: !Ref ListenerTargetGroup
+  DashboardUrl:
+    Value: !Sub 'https://${DashboardDomain}'
+  CloudflareCnameTarget:
+    Description: Create a DNS-only CNAME for DashboardDomain pointing to this existing ALB hostname
+    Value: hilite-prod-alb-2078045760.ap-southeast-1.elb.amazonaws.com
+  CognitoUserPoolId:
+    Value: !Ref DashboardUserPool
+  CognitoDomain:
+    Value: !Sub 'https://${DashboardUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+  SecretArn:
+    Value: !Ref ListenerSecret
+  RepositoryUri:
+    Value: !GetAtt ListenerRepository.RepositoryUri
+  ImageBuildProjectName:
+    Value: !Ref ImageBuildProject
+  LogGroupName:
+    Value: !Ref ListenerLogGroup

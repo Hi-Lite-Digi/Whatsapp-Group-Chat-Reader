@@ -1,0 +1,14 @@
+.git
+.gitignore
+.DS_Store
+.env
+.env.*
+!.env.example
+auth_info
+data
+downloads
+runtime
+node_modules
+dist
+*.log
+coverage

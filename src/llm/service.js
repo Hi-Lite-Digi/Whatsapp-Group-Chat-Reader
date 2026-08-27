@@ -45,8 +45,11 @@ Text / Caption: ${content || '[No text content]'}
   let rawResultText = '';
 
   try {
+    const environmentOnlyApiKeys = process.env.ENV_ONLY_API_KEYS === 'true';
     if (provider === 'gemini') {
-      const apiKey = settings.gemini_api_key || process.env.GEMINI_API_KEY;
+      const apiKey = environmentOnlyApiKeys
+        ? process.env.GEMINI_API_KEY
+        : settings.gemini_api_key || process.env.GEMINI_API_KEY;
       if (!apiKey) throw new Error('Gemini API key is missing in settings');
 
       const genAI = new GoogleGenerativeAI(apiKey);
@@ -69,7 +72,9 @@ Text / Caption: ${content || '[No text content]'}
       const res = await model.generateContent(parts);
       rawResultText = res.response.text();
     } else if (provider === 'openai') {
-      const apiKey = settings.openai_api_key || process.env.OPENAI_API_KEY;
+      const apiKey = environmentOnlyApiKeys
+        ? process.env.OPENAI_API_KEY
+        : settings.openai_api_key || process.env.OPENAI_API_KEY;
       if (!apiKey) throw new Error('OpenAI API key is missing in settings');
 
       const openai = new OpenAI({ apiKey });
@@ -95,7 +100,9 @@ Text / Caption: ${content || '[No text content]'}
 
       rawResultText = response.choices[0].message.content;
     } else if (provider === 'anthropic') {
-      const apiKey = settings.anthropic_api_key || process.env.ANTHROPIC_API_KEY;
+      const apiKey = environmentOnlyApiKeys
+        ? process.env.ANTHROPIC_API_KEY
+        : settings.anthropic_api_key || process.env.ANTHROPIC_API_KEY;
       if (!apiKey) throw new Error('Anthropic API key is missing in settings');
 
       const anthropic = new Anthropic({ apiKey });

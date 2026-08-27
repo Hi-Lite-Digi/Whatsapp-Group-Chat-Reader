@@ -1,32 +1,41 @@
 import React, { useState, useEffect } from 'react';
 import { Database, Search, Download, Eye, FileText, Image as ImageIcon } from 'lucide-react';
 
-export default function ExtractionsTab({ groups }) {
+export default function ExtractionsTab({ chats }) {
   const [messages, setMessages] = useState([]);
   const [search, setSearch] = useState('');
-  const [selectedGroup, setSelectedGroup] = useState('');
+  const [selectedChat, setSelectedChat] = useState('');
   const [selectedItem, setSelectedItem] = useState(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    fetchMessages();
-  }, [selectedGroup, search]);
+    let cancelled = false;
+    const fetchMessages = async () => {
+      setLoading(true);
+      try {
+        const params = new URLSearchParams();
+        if (selectedChat) params.append('groupId', selectedChat);
+        if (search) params.append('search', search);
+        const res = await fetch(`/api/messages?${params.toString()}`);
+        const data = await res.json();
+        if (!cancelled) setMessages(data);
+      } catch (err) {
+        if (!cancelled) console.error('Error fetching messages:', err);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
 
-  const fetchMessages = async () => {
-    setLoading(true);
-    try {
-      const params = new URLSearchParams();
-      if (selectedGroup) params.append('groupId', selectedGroup);
-      if (search) params.append('search', search);
-      const res = await fetch(`/api/messages?${params.toString()}`);
-      const data = await res.json();
-      setMessages(data);
-    } catch (err) {
-      console.error('Error fetching messages:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
+    fetchMessages();
+    const refreshTimer = setInterval(fetchMessages, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(refreshTimer);
+    };
+  }, [selectedChat, search]);
+
+  const groupChats = chats.filter(chat => chat.chat_type === 'group');
+  const directChats = chats.filter(chat => chat.chat_type === 'dm');
 
   const parseJSON = (str) => {
     if (!str) return null;
@@ -40,10 +49,10 @@ export default function ExtractionsTab({ groups }) {
       <div className="glass-panel" style={{ padding: '20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '16px' }}>
         <div>
           <h2 style={{ fontSize: '1.2rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Database size={22} color="#06b6d4" /> Extracted Database Explorer
+            <Database size={22} color="#06b6d4" /> Stored Message Explorer
           </h2>
           <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginTop: '2px' }}>
-            Search and export parsed WhatsApp group records stored in SQLite.
+            Search historical and real-time messages from your selected groups and DMs.
           </p>
         </div>
 
@@ -63,13 +72,20 @@ export default function ExtractionsTab({ groups }) {
           <select
             className="input-field"
             style={{ width: 'auto' }}
-            value={selectedGroup}
-            onChange={(e) => setSelectedGroup(e.target.value)}
+            value={selectedChat}
+            onChange={(e) => setSelectedChat(e.target.value)}
           >
-            <option value="">All Groups</option>
-            {groups.map(g => (
-              <option key={g.id} value={g.id}>{g.name}</option>
-            ))}
+            <option value="">All Chats</option>
+            <optgroup label="Groups">
+              {groupChats.map(chat => (
+                <option key={chat.id} value={chat.id}>{chat.name}</option>
+              ))}
+            </optgroup>
+            <optgroup label="Direct Messages">
+              {directChats.map(chat => (
+                <option key={chat.id} value={chat.id}>{chat.name}</option>
+              ))}
+            </optgroup>
           </select>
 
           <a href="/api/export?format=json" download className="btn btn-secondary">
@@ -88,7 +104,7 @@ export default function ExtractionsTab({ groups }) {
             <thead>
               <tr style={{ background: 'rgba(0,0,0,0.3)', borderBottom: '1px solid var(--border-color)', color: 'var(--text-muted)' }}>
                 <th style={{ padding: '14px 16px' }}>ID</th>
-                <th style={{ padding: '14px 16px' }}>Group / Sender</th>
+                <th style={{ padding: '14px 16px' }}>Chat / Sender</th>
                 <th style={{ padding: '14px 16px' }}>Type</th>
                 <th style={{ padding: '14px 16px' }}>Content / Extracted Text</th>
                 <th style={{ padding: '14px 16px' }}>Schema</th>
@@ -101,7 +117,7 @@ export default function ExtractionsTab({ groups }) {
               {messages.length === 0 ? (
                 <tr>
                   <td colSpan="8" style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
-                    {loading ? 'Loading records...' : 'No extraction records found.'}
+                    {loading ? 'Loading records...' : 'No stored messages found for the linked WhatsApp account.'}
                   </td>
                 </tr>
               ) : (
@@ -116,6 +132,9 @@ export default function ExtractionsTab({ groups }) {
                       </td>
                       <td style={{ padding: '14px 16px' }}>
                         <span className="badge badge-info">{m.message_type.replace('Message', '')}</span>
+                        <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '5px', textTransform: 'capitalize' }}>
+                          {m.chat_type === 'dm' ? 'DM' : 'Group'} · {m.source || 'realtime'}
+                        </div>
                       </td>
                       <td style={{ padding: '14px 16px', maxWidth: '280px' }}>
                         <div style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
@@ -128,7 +147,9 @@ export default function ExtractionsTab({ groups }) {
                         )}
                       </td>
                       <td style={{ padding: '14px 16px' }}>
-                        <span className="badge badge-warning">{m.schema_id || 'default'}</span>
+                        {m.chat_type === 'dm'
+                          ? <span style={{ color: 'var(--text-dim)' }}>Not run</span>
+                          : <span className="badge badge-warning">{m.schema_id || 'default'}</span>}
                       </td>
                       <td style={{ padding: '14px 16px', maxWidth: '300px' }}>
                         {extData ? (
@@ -140,7 +161,7 @@ export default function ExtractionsTab({ groups }) {
                         )}
                       </td>
                       <td style={{ padding: '14px 16px', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                        {new Date(m.timestamp).toLocaleTimeString()}
+                        {new Date(m.timestamp).toLocaleString()}
                       </td>
                       <td style={{ padding: '14px 16px' }}>
                         <button className="btn btn-secondary" style={{ padding: '6px 12px', fontSize: '0.8rem' }} onClick={() => setSelectedItem(m)}>
@@ -167,7 +188,7 @@ export default function ExtractionsTab({ groups }) {
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', maxHeight: '70vh', overflowY: 'auto' }}>
               <div>
-                <label style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Group & Sender</label>
+                <label style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Chat &amp; Sender</label>
                 <div style={{ fontWeight: 600 }}>{selectedItem.sender_name} ({selectedItem.sender_id}) in {selectedItem.group_name}</div>
               </div>
 
@@ -198,14 +219,20 @@ export default function ExtractionsTab({ groups }) {
                 </div>
               )}
 
-              <div>
-                <label style={{ fontSize: '0.75rem', color: '#4ade80', textTransform: 'uppercase', fontWeight: 600 }}>LLM Extracted JSON Result</label>
-                <div style={{ background: '#05070d', padding: '14px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', fontSize: '0.85rem', fontFamily: 'var(--font-mono)', marginTop: '4px' }}>
-                  <pre style={{ color: '#4ade80' }}>
-                    {JSON.stringify(parseJSON(selectedItem.extracted_data), null, 2)}
-                  </pre>
+              {selectedItem.extracted_data ? (
+                <div>
+                  <label style={{ fontSize: '0.75rem', color: '#4ade80', textTransform: 'uppercase', fontWeight: 600 }}>LLM Extracted JSON Result</label>
+                  <div style={{ background: '#05070d', padding: '14px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)', fontSize: '0.85rem', fontFamily: 'var(--font-mono)', marginTop: '4px' }}>
+                    <pre style={{ color: '#4ade80' }}>
+                      {JSON.stringify(parseJSON(selectedItem.extracted_data), null, 2)}
+                    </pre>
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+                  {selectedItem.chat_type === 'dm' ? 'LLM extraction is intentionally disabled for direct messages.' : 'No LLM extraction is stored for this message.'}
+                </div>
+              )}
             </div>
           </div>
         </div>

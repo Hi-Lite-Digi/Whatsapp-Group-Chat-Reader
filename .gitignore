@@ -4,4 +4,6 @@ auth_info/
 downloads/
 data/
 .env
+.env.production
 *.log
+.DS_Store

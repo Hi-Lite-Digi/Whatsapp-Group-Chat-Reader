@@ -12,6 +12,7 @@ export default function SettingsTab({ settings, onSaveSettings }) {
     auto_download_media: 'true'
   });
   const [savedSuccess, setSavedSuccess] = useState(false);
+  const apiKeysManagedByServer = settings?.api_keys_managed === 'environment';
 
   useEffect(() => {
     if (settings) {
@@ -63,7 +64,9 @@ export default function SettingsTab({ settings, onSaveSettings }) {
               <Settings size={22} color="#25d366" /> System & LLM Configurations
             </h2>
             <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginTop: '2px' }}>
-              Select active LLM Provider, model choices, and API keys.
+              {apiKeysManagedByServer
+                ? 'Select the provider and model. API keys are managed securely by the server.'
+                : 'Select active LLM Provider, model choices, and API keys.'}
             </p>
           </div>
           {savedSuccess && (
@@ -128,6 +131,7 @@ export default function SettingsTab({ settings, onSaveSettings }) {
                   className="input-field"
                   placeholder="AIzaSy..."
                   value={formData.gemini_api_key || ''}
+                  disabled={apiKeysManagedByServer}
                   onChange={(e) => setFormData({ ...formData, gemini_api_key: e.target.value })}
                 />
               </div>
@@ -139,6 +143,7 @@ export default function SettingsTab({ settings, onSaveSettings }) {
                   className="input-field"
                   placeholder="sk-proj-..."
                   value={formData.openai_api_key || ''}
+                  disabled={apiKeysManagedByServer}
                   onChange={(e) => setFormData({ ...formData, openai_api_key: e.target.value })}
                 />
               </div>
@@ -150,6 +155,7 @@ export default function SettingsTab({ settings, onSaveSettings }) {
                   className="input-field"
                   placeholder="sk-ant-..."
                   value={formData.anthropic_api_key || ''}
+                  disabled={apiKeysManagedByServer}
                   onChange={(e) => setFormData({ ...formData, anthropic_api_key: e.target.value })}
                 />
               </div>

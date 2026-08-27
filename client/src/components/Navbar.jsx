@@ -1,5 +1,5 @@
 import React from 'react';
-import { MessageSquare, LayoutDashboard, Users, Activity, Database, FileCode, Settings, QrCode, RefreshCw, LogOut, Send } from 'lucide-react';
+import { MessageSquare, LayoutDashboard, Users, MessageCircle, Activity, Database, FileCode, Settings, QrCode, RefreshCw, LogOut, Send, ArrowRightLeft } from 'lucide-react';
 
 export default function Navbar({ activeTab, setActiveTab, connState, onConnect, onLogout, onSyncGroups }) {
   const isConnected = connState.status === 'connected';
@@ -16,9 +16,9 @@ export default function Navbar({ activeTab, setActiveTab, connState, onConnect, 
           </div>
           <div>
             <h1 style={{ fontSize: '1.25rem', fontWeight: 700, letterSpacing: '-0.02em', background: 'linear-gradient(to right, #ffffff, #9ca3af)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
-              WhatsApp Group Reader
+              WhatsApp Chat Reader
             </h1>
-            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Real-Time Multimodal LLM Extraction Engine</span>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Selected Groups &amp; Direct Messages</span>
           </div>
         </div>
 
@@ -60,6 +60,8 @@ export default function Navbar({ activeTab, setActiveTab, connState, onConnect, 
       <div style={{ maxWidth: '1400px', margin: '0 auto', padding: '0 24px', display: 'flex', gap: '8px', overflowX: 'auto' }}>
         <TabButton id="overview" label="Overview" icon={<LayoutDashboard size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
         <TabButton id="groups" label="Monitored Groups" icon={<Users size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
+        <TabButton id="oracle_sync" label="Quotation Sync" icon={<ArrowRightLeft size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
+        <TabButton id="dms" label="Selected DMs" icon={<MessageCircle size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
         <TabButton id="send_message" label="Send Message" icon={<Send size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
         <TabButton id="live" label="Live Stream" icon={<Activity size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
         <TabButton id="extractions" label="Extractions Data" icon={<Database size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />

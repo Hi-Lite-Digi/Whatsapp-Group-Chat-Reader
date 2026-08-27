@@ -9,12 +9,15 @@
     "dev": "nodemon src/server/index.js",
     "build:client": "vite build",
     "build": "npm run build:client",
+    "backup": "node scripts/backup-runtime.mjs",
+    "healthcheck": "node scripts/healthcheck.mjs",
+    "test": "node --test",
     "setup": "npm install && npm run build"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.36.0",
     "@google/generative-ai": "^0.22.0",
-    "@whiskeysockets/baileys": "^6.7.18",
+    "@whiskeysockets/baileys": "^6.7.24",
     "axios": "^1.7.9",
     "better-sqlite3": "^11.8.0",
     "cors": "^2.8.5",

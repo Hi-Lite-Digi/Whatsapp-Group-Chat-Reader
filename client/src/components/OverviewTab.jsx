@@ -1,5 +1,5 @@
 import React from 'react';
-import { MessageSquare, Database, Users, Image as ImageIcon, Cpu, ArrowRight, ShieldCheck } from 'lucide-react';
+import { MessageSquare, MessageCircle, Database, Users, Image as ImageIcon, Cpu, ArrowRight, ShieldCheck } from 'lucide-react';
 
 export default function OverviewTab({ stats, connState, settings, recentExtractions, setActiveTab }) {
   return (
@@ -13,7 +13,7 @@ export default function OverviewTab({ stats, connState, settings, recentExtracti
               <ShieldCheck size={20} /> WhatsApp Session Not Connected
             </h3>
             <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginTop: '4px' }}>
-              Scan the QR code with your WhatsApp app (Linked Devices) to start listening to group chats in real-time.
+              Scan the QR code with your WhatsApp app (Linked Devices) to start listening to selected chats in real-time.
             </p>
           </div>
           <button className="btn btn-primary" onClick={() => setActiveTab('groups')}>
@@ -27,7 +27,7 @@ export default function OverviewTab({ stats, connState, settings, recentExtracti
         <MetricCard
           title="Captured Messages"
           value={stats.totalMessages || 0}
-          subtitle="Real-time group messages"
+          subtitle="Selected chat history & live"
           icon={<MessageSquare size={24} color="#25d366" />}
           gradient="linear-gradient(135deg, rgba(37, 211, 102, 0.15), rgba(18, 140, 126, 0.05))"
         />
@@ -44,6 +44,13 @@ export default function OverviewTab({ stats, connState, settings, recentExtracti
           subtitle="Active WhatsApp readers"
           icon={<Users size={24} color="#8b5cf6" />}
           gradient="linear-gradient(135deg, rgba(139, 92, 246, 0.15), rgba(109, 40, 217, 0.05))"
+        />
+        <MetricCard
+          title="Selected DMs"
+          value={stats.activeDms || 0}
+          subtitle="Opt-in direct-message readers"
+          icon={<MessageCircle size={24} color="#ec4899" />}
+          gradient="linear-gradient(135deg, rgba(236, 72, 153, 0.15), rgba(157, 23, 77, 0.05))"
         />
         <MetricCard
           title="Media & Documents"
