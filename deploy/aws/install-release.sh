@@ -101,6 +101,16 @@ cat > /usr/local/sbin/mrrjestic-upload-backups <<'UPLOAD_BACKUPS'
 #!/usr/bin/env bash
 set -euo pipefail
 source /opt/mrrjestic-whatsapp-listener/release.env
+find /var/lib/mrrjestic/backups -mindepth 1 -maxdepth 1 -type d -mmin -30 -print0 \
+  | while IFS= read -r -d '' backup_dir; do
+      aws s3 cp "$backup_dir" \
+        "s3://$ARTIFACT_BUCKET/whatsapp-listener/backups/$(basename "$backup_dir")/" \
+        --recursive \
+        --region "$AWS_REGION" \
+        --sse aws:kms \
+        --sse-kms-key-id "$KMS_KEY_ARN" \
+        --only-show-errors
+    done
 find /var/lib/mrrjestic/backups -maxdepth 1 -type f -mmin -30 -print0 \
   | while IFS= read -r -d '' backup_file; do
       aws s3 cp "$backup_file" \
@@ -170,4 +180,3 @@ done
 
 docker logs --tail 100 mrrjestic-whatsapp-listener >&2 || true
 exit 1
-

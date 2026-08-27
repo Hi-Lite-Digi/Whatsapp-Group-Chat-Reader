@@ -365,16 +365,20 @@ Resources:
           wanted_serial=$(printf '%s' "$wanted_serial" | tr -d '-')
           data_device=''
           for attempt in $(seq 1 120); do
-            data_device=$(lsblk -ndo PATH,SERIAL | awk -v serial="$wanted_serial" '$2 == serial {print $1; exit}')
-            if [ -n "$data_device" ]; then break; fi
+            data_device=$(readlink -f "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$wanted_serial" 2>/dev/null || true)
+            if [ -z "$data_device" ]; then
+              data_device=$(lsblk -ndo PATH,SERIAL | awk -v serial="$wanted_serial" '$2 == serial {print $1; exit}')
+            fi
+            if [ -b "$data_device" ]; then break; fi
+            data_device=''
             sleep 5
           done
-          test -n "$data_device"
+          test -b "$data_device"
           if ! blkid "$data_device" >/dev/null 2>&1; then
-            mkfs.xfs -L MRRJESTIC_DATA "$data_device"
+            mkfs.xfs -L MRR_DATA "$data_device"
           fi
-          if ! grep -q '^LABEL=MRRJESTIC_DATA ' /etc/fstab; then
-            printf 'LABEL=MRRJESTIC_DATA /var/lib/mrrjestic xfs defaults,nofail 0 2\n' >> /etc/fstab
+          if ! grep -q '^LABEL=MRR_DATA ' /etc/fstab; then
+            printf 'LABEL=MRR_DATA /var/lib/mrrjestic xfs defaults,nofail 0 2\n' >> /etc/fstab
           fi
           mountpoint -q /var/lib/mrrjestic || mount /var/lib/mrrjestic
           mkdir -p /var/lib/mrrjestic/auth /var/lib/mrrjestic/data /var/lib/mrrjestic/media /var/lib/mrrjestic/backups
