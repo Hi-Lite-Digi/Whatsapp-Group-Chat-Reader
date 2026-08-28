@@ -33,6 +33,7 @@ import {
   isConfiguredSupplierMessage,
   processOracleGroupMessage
 } from '../oracle/sync.js';
+import { getDisconnectPolicy } from './disconnect-policy.js';
 
 const authFolder = process.env.AUTH_FOLDER || './auth_info';
 if (!fs.existsSync(authFolder)) {
@@ -110,11 +111,23 @@ function reconnectDelayMs(isRateLimited = false) {
   return Math.round(capped * jitter);
 }
 
-function scheduleReconnect(reason, { isRateLimited = false } = {}) {
+function scheduleReconnect(reason, {
+  isRateLimited = false,
+  force = false,
+  delayMsOverride = null
+} = {}) {
+  if (force) {
+    reconnectSuppressed = false;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    isReconnecting = false;
+  }
   if (reconnectSuppressed || reconnectTimer || isReconnecting) return false;
 
   reconnectAttempts++;
-  const delayMs = reconnectDelayMs(isRateLimited);
+  const delayMs = Number.isFinite(delayMsOverride)
+    ? Math.max(0, delayMsOverride)
+    : reconnectDelayMs(isRateLimited);
   isReconnecting = true;
   emitLog(`Reconnecting in ${Math.round(delayMs / 1000)}s (attempt ${reconnectAttempts}; ${reason}).`);
   reconnectTimer = setTimeout(async () => {
@@ -206,6 +219,7 @@ export async function clearAuthSession(options = {}) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  isReconnecting = false;
   if (sock) {
     try {
       sock.ev.removeAllListeners();
@@ -398,7 +412,21 @@ async function initializeWhatsAppClient() {
       defaultQueryTimeoutMs: 60000
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    let credentialsSaveError = null;
+    let credentialsSavePromise = Promise.resolve();
+    sock.ev.on('creds.update', () => {
+      credentialsSavePromise = credentialsSavePromise
+        .then(async () => {
+          try {
+            await saveCreds();
+            credentialsSaveError = null;
+          } catch (error) {
+            credentialsSaveError = error;
+            emitLog(`Could not persist updated WhatsApp credentials: ${error.message}`);
+          }
+        });
+      return credentialsSavePromise;
+    });
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -434,14 +462,15 @@ async function initializeWhatsAppClient() {
       if (connection === 'close') {
         connectionStatus = 'disconnected';
         currentQrDataUrl = null;
-        broadcastState();
+        currentPairingCode = null;
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-        const isConflict = statusCode === 440 || statusCode === DisconnectReason.connectionReplaced || statusCode === DisconnectReason.loggedOut;
         const disconnectMessage = lastDisconnect?.error?.message || 'Unknown disconnect';
-        const isRateLimited = statusCode === 429;
-        const shouldReconnect = !isLoggedOut && !isConflict;
+        const {
+          isRestartRequired,
+          isRateLimited,
+          shouldReconnect
+        } = getDisconnectPolicy(statusCode, DisconnectReason);
 
         lastDisconnectAt = new Date().toISOString();
         lastDisconnectReason = `${disconnectMessage}${statusCode ? ` (status ${statusCode})` : ''}`;
@@ -449,12 +478,23 @@ async function initializeWhatsAppClient() {
 
         emitLog(`WhatsApp connection closed (${disconnectMessage}; status ${statusCode}). Reconnect: ${shouldReconnect}`);
 
-        if (shouldReconnect) {
+        if (isRestartRequired) {
+          emitLog('WhatsApp accepted the device pairing. Saving credentials and restarting the socket...');
+          await credentialsSavePromise;
+          if (credentialsSaveError) {
+            emitLog('The socket will restart, but the credential save reported an error.');
+          }
+          scheduleReconnect('pairing completed; WhatsApp requested a socket restart', {
+            force: true,
+            delayMsOverride: 1000
+          });
+        } else if (shouldReconnect) {
           scheduleReconnect(disconnectMessage, { isRateLimited });
         } else {
           reconnectAttempts = 0;
           emitLog('Automatic reconnect paused because WhatsApp logged out or another listener replaced this session. Re-pair from the dashboard after confirming only one listener is running.');
         }
+        broadcastState();
       }
     });
 
