@@ -34,6 +34,7 @@ import {
   processOracleGroupMessage
 } from '../oracle/sync.js';
 import { getDisconnectPolicy } from './disconnect-policy.js';
+import { groupJidFrom, groupNameFrom } from './group-discovery.js';
 
 const authFolder = process.env.AUTH_FOLDER || './auth_info';
 if (!fs.existsSync(authFolder)) {
@@ -49,6 +50,7 @@ let isReconnecting = false;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let reconnectWatchdogTimer = null;
+let groupSyncTimer = null;
 let reconnectSuppressed = false;
 let initializationPromise = null;
 let lastConnectedAt = null;
@@ -59,10 +61,14 @@ const processStartedAt = new Date().toISOString();
 const RECONNECT_BASE_DELAY_MS = Math.max(1000, Number.parseInt(process.env.WHATSAPP_RECONNECT_BASE_DELAY_MS || '5000', 10));
 const RECONNECT_MAX_DELAY_MS = Math.max(RECONNECT_BASE_DELAY_MS, Number.parseInt(process.env.WHATSAPP_RECONNECT_MAX_DELAY_MS || '300000', 10));
 const RECONNECT_WATCHDOG_MS = Math.max(15000, Number.parseInt(process.env.WHATSAPP_RECONNECT_WATCHDOG_MS || '60000', 10));
+const INITIAL_GROUP_SYNC_DELAY_MS = Math.max(1000, Number.parseInt(process.env.WHATSAPP_INITIAL_GROUP_SYNC_DELAY_MS || '5000', 10));
 const sentMessageCache = new Map();
 const pendingHistoryByGroup = new Map();
 const pendingHistoryByDm = new Map();
 const contactInfoByJid = new Map();
+const discoveredGroupChats = new Map();
+const groupMetadataRequests = new Map();
+const bulkGroupFetchAttemptedAccounts = new Set();
 const dmHistoryAnchors = new Map();
 const requestedDmHistory = new Set();
 const groupHistoryAnchors = new Map();
@@ -156,6 +162,17 @@ function startReconnectWatchdog() {
   reconnectWatchdogTimer.unref?.();
 }
 
+function scheduleInitialGroupSync() {
+  if (groupSyncTimer) clearTimeout(groupSyncTimer);
+  const scheduledSocket = sock;
+  groupSyncTimer = setTimeout(() => {
+    groupSyncTimer = null;
+    if (sock !== scheduledSocket || connectionStatus !== 'connected') return;
+    void syncGroups();
+  }, INITIAL_GROUP_SYNC_DELAY_MS);
+  groupSyncTimer.unref?.();
+}
+
 function emitOracleResult(oracleResult) {
   if (oracleResult?.run && ioInstance) {
     ioInstance.emit('oracle_run_result', oracleResult.run);
@@ -219,6 +236,10 @@ export async function clearAuthSession(options = {}) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  if (groupSyncTimer) {
+    clearTimeout(groupSyncTimer);
+    groupSyncTimer = null;
+  }
   isReconnecting = false;
   if (sock) {
     try {
@@ -237,6 +258,9 @@ export async function clearAuthSession(options = {}) {
   pendingHistoryByGroup.clear();
   pendingHistoryByDm.clear();
   contactInfoByJid.clear();
+  discoveredGroupChats.clear();
+  groupMetadataRequests.clear();
+  bulkGroupFetchAttemptedAccounts.clear();
   dmHistoryAnchors.clear();
   requestedDmHistory.clear();
   groupHistoryAnchors.clear();
@@ -315,6 +339,50 @@ function emitDmUpdates() {
   if (ioInstance) ioInstance.emit('dms_updated', getDmChats());
 }
 
+function emitGroupUpdates() {
+  if (ioInstance) ioInstance.emit('groups_updated', getGroups());
+}
+
+function currentWhatsappAccountId() {
+  if (!sock?.user?.id) return null;
+  try {
+    return jidNormalizedUser(sock.user.id);
+  } catch {
+    return sock.user.id;
+  }
+}
+
+function rememberGroupChat(value, fallbackJid = null) {
+  const jid = groupJidFrom(value) || groupJidFrom(fallbackJid);
+  if (!jid) return null;
+
+  const existing = db.prepare('SELECT * FROM groups WHERE id = ?').get(jid);
+  const suppliedName = groupNameFrom(value);
+  const name = suppliedName || existing?.name || 'Unnamed Group';
+  discoveredGroupChats.set(jid, name);
+  upsertGroup(jid, name, currentWhatsappAccountId());
+  return db.prepare('SELECT * FROM groups WHERE id = ?').get(jid);
+}
+
+async function refreshGroupMetadata(jid) {
+  if (!groupJidFrom(jid) || !sock || connectionStatus !== 'connected') return null;
+  if (groupMetadataRequests.has(jid)) return groupMetadataRequests.get(jid);
+
+  const request = (async () => {
+    try {
+      const metadata = await sock.groupMetadata(jid);
+      return rememberGroupChat(metadata, jid);
+    } catch (error) {
+      emitLog(`Could not refresh metadata for WhatsApp group ${jid}: ${error.message}`);
+      return rememberGroupChat(jid);
+    } finally {
+      groupMetadataRequests.delete(jid);
+    }
+  })();
+  groupMetadataRequests.set(jid, request);
+  return request;
+}
+
 function rememberDmHistoryAnchor(dmId, msg) {
   if (!dmId || !msg?.key?.id || !msg.messageTimestamp) return;
   const existing = dmHistoryAnchors.get(dmId);
@@ -357,6 +425,10 @@ async function initializeWhatsAppClient() {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
+  }
+  if (groupSyncTimer) {
+    clearTimeout(groupSyncTimer);
+    groupSyncTimer = null;
   }
   if (sock) {
     try {
@@ -451,15 +523,21 @@ async function initializeWhatsAppClient() {
         emitLog(`WhatsApp connected successfully as ${sock.user.name || sock.user.id}!`);
         const accountId = jidNormalizedUser(sock.user.id);
         if (setActiveWhatsappAccount(accountId)) {
+          discoveredGroupChats.clear();
           emitLog('Linked account changed. All chat monitoring and quotation sync controls were paused for safety.');
         }
         broadcastState();
 
-        // Refresh joined group list
-        await syncGroups();
+        // Let the socket settle before the group IQ query. Baileys can close a
+        // newly opened socket with status 428 when this query is sent too early.
+        scheduleInitialGroupSync();
       }
 
       if (connection === 'close') {
+        if (groupSyncTimer) {
+          clearTimeout(groupSyncTimer);
+          groupSyncTimer = null;
+        }
         connectionStatus = 'disconnected';
         currentQrDataUrl = null;
         currentPairingCode = null;
@@ -513,12 +591,18 @@ async function initializeWhatsAppClient() {
       let importedDms = 0;
       let bufferedGroups = 0;
       let bufferedDms = 0;
+      const discoveredGroupIds = new Set();
       let discoveredDms = 0;
       const historyGroups = new Set();
 
       for (const contact of contacts) rememberContact(contact);
 
       for (const chat of chats) {
+        const group = rememberGroupChat(chat);
+        if (group) {
+          discoveredGroupIds.add(group.id);
+          continue;
+        }
         const aliases = dmJidsFrom(chat);
         if (aliases.length === 0 || aliases.some(isOwnDirectJid)) continue;
         if (upsertDmFromJids(aliases, displayNameFromContact(chat))) discoveredDms++;
@@ -531,9 +615,10 @@ async function initializeWhatsAppClient() {
 
         let chatRecord;
         if (chatType === 'group') {
+          chatRecord = rememberGroupChat(remoteJid);
+          if (chatRecord) discoveredGroupIds.add(chatRecord.id);
           historyGroups.add(remoteJid);
           rememberGroupHistoryAnchor(remoteJid, msg);
-          chatRecord = db.prepare('SELECT id, is_monitored FROM groups WHERE id = ?').get(remoteJid);
         } else {
           const aliases = dmJidsFrom(msg);
           if (aliases.some(isOwnDirectJid)) continue;
@@ -557,6 +642,11 @@ async function initializeWhatsAppClient() {
         }
       }
 
+      if (discoveredGroupIds.size > 0) {
+        emitGroupUpdates();
+        await Promise.allSettled([...discoveredGroupIds].map(groupId => refreshGroupMetadata(groupId)));
+        emitGroupUpdates();
+      }
       if (discoveredDms > 0) emitDmUpdates();
       emitLog(`History sync chunk received${progress != null ? ` (${progress}% complete)` : ''}: ${importedGroups} group + ${importedDms} DM messages imported; ${bufferedGroups} group + ${bufferedDms} DM messages held in memory pending selection${isLatest ? ' (latest sync)' : ''}.`);
       broadcastState();
@@ -580,20 +670,48 @@ async function initializeWhatsAppClient() {
       if (changed) emitDmUpdates();
     };
 
-    const handleChatUpdates = (chats = []) => {
-      let changed = false;
+    const handleChatUpdates = async (chats = []) => {
+      let dmsChanged = false;
+      let groupsChanged = false;
+      const groupsToRefresh = new Set();
       for (const chat of chats) {
+        const group = rememberGroupChat(chat);
+        if (group) {
+          groupsChanged = true;
+          if (!groupNameFrom(chat)) groupsToRefresh.add(group.id);
+          continue;
+        }
         const aliases = dmJidsFrom(chat);
         if (aliases.length === 0 || aliases.some(isOwnDirectJid)) continue;
-        if (upsertDmFromJids(aliases, displayNameFromContact(chat))) changed = true;
+        if (upsertDmFromJids(aliases, displayNameFromContact(chat))) dmsChanged = true;
       }
-      if (changed) emitDmUpdates();
+      if (groupsChanged) emitGroupUpdates();
+      if (groupsToRefresh.size > 0) {
+        await Promise.allSettled([...groupsToRefresh].map(groupId => refreshGroupMetadata(groupId)));
+        emitGroupUpdates();
+      }
+      if (dmsChanged) emitDmUpdates();
+    };
+
+    const handleGroupUpdates = (groups = []) => {
+      let changed = false;
+      for (const group of groups) {
+        if (rememberGroupChat(group)) changed = true;
+      }
+      if (changed) emitGroupUpdates();
     };
 
     sock.ev.on('contacts.upsert', handleContactUpdates);
     sock.ev.on('contacts.update', handleContactUpdates);
     sock.ev.on('chats.upsert', handleChatUpdates);
     sock.ev.on('chats.update', handleChatUpdates);
+    sock.ev.on('groups.upsert', handleGroupUpdates);
+    sock.ev.on('groups.update', handleGroupUpdates);
+    sock.ev.on('group-participants.update', ({ id }) => {
+      if (!rememberGroupChat(id)) return;
+      emitGroupUpdates();
+      void refreshGroupMetadata(id).then(emitGroupUpdates);
+    });
     sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
       if (upsertDmFromJids([jid, lid])) emitDmUpdates();
     });
@@ -612,23 +730,37 @@ async function initializeWhatsAppClient() {
 
 export async function syncGroups() {
   if (!sock || connectionStatus !== 'connected') return [];
-  try {
-    const groupsMap = await sock.groupFetchAllParticipating();
-    const accountId = jidNormalizedUser(sock.user.id);
-    const groupList = [];
-    for (const [jid, group] of Object.entries(groupsMap)) {
-      const savedGroup = upsertGroup(jid, group.subject || 'Unnamed Group', accountId);
-      groupList.push(savedGroup);
+  let groupsMap = {};
+  const accountId = currentWhatsappAccountId();
+  const shouldFetchBulkGroups = accountId && !bulkGroupFetchAttemptedAccounts.has(accountId);
+  if (shouldFetchBulkGroups) {
+    bulkGroupFetchAttemptedAccounts.add(accountId);
+    try {
+      groupsMap = await sock.groupFetchAllParticipating();
+    } catch (error) {
+      console.error('Error fetching the bulk WhatsApp group list:', error.message);
+      emitLog(`The bulk WhatsApp group list was unavailable; checking discovered chats instead (${error.message}).`);
     }
-    if (ioInstance) {
-      ioInstance.emit('groups_updated', getGroups());
-    }
-    emitLog(`Synced ${groupList.length} WhatsApp group chats.`);
-    return groupList;
-  } catch (err) {
-    console.error('Error syncing WhatsApp groups:', err.message);
-    return [];
   }
+
+  for (const [jid, group] of Object.entries(groupsMap || {})) {
+    rememberGroupChat(group, jid);
+  }
+
+  const bulkGroupIds = new Set(Object.keys(groupsMap || {}));
+  const fallbackGroupIds = [...discoveredGroupChats.keys()]
+    .filter(groupId => !bulkGroupIds.has(groupId));
+  if (fallbackGroupIds.length > 0) {
+    await Promise.allSettled(fallbackGroupIds.map(groupId => refreshGroupMetadata(groupId)));
+  }
+
+  const groupList = getGroups();
+  emitGroupUpdates();
+  const bulkSummary = shouldFetchBulkGroups
+    ? `${bulkGroupIds.size} from the bulk list`
+    : 'bulk query already attempted safely';
+  emitLog(`Synced ${groupList.length} WhatsApp group chats (${bulkSummary}, ${fallbackGroupIds.length} recovered from chat events).`);
+  return groupList;
 }
 
 export async function addDmByPhoneNumber(phoneNumber, name = '') {
@@ -718,7 +850,12 @@ async function handleIncomingMessage(msg, options = {}) {
     let chatRecord;
     if (chatType === 'group') {
       rememberGroupHistoryAnchor(remoteJid, msg);
-      chatRecord = db.prepare('SELECT * FROM groups WHERE id = ?').get(remoteJid);
+      const existingGroup = db.prepare('SELECT id FROM groups WHERE id = ?').get(remoteJid);
+      chatRecord = rememberGroupChat(remoteJid);
+      if (!existingGroup && chatRecord) {
+        emitGroupUpdates();
+        void refreshGroupMetadata(remoteJid).then(emitGroupUpdates);
+      }
     } else {
       const aliases = dmJidsFrom(msg);
       if (aliases.some(isOwnDirectJid)) return;
