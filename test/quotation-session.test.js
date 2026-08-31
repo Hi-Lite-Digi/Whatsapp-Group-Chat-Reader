@@ -51,6 +51,18 @@ test('normalizes common supplier model shorthand without confusing PS4 and PS4S'
   assert.equal(canonicalModel('Bridgestone POTENZA RE71RS XL'), 'potenza re71rs');
 });
 
+test('does not assemble a tyre size from digits in separate messages', () => {
+  const text = [
+    'Boss 235/55/19 Michelin have?',
+    '$235',
+    'Which model?',
+    '2026?',
+    'Yes',
+    'Ps5'
+  ].join('\n');
+  assert.deepEqual(extractTyreSizes(text), ['235/55/19']);
+});
+
 test('joins a fragmented model, price, and year exchange', () => {
   const session = sessionFor([
     ['R', '225/45R18 Michelin have?'],
@@ -143,4 +155,20 @@ test('uses the supplier correction instead of the requester typo', () => {
   assert.equal(quotationItemHasEvidence({
     brand: 'Pirelli', model: 'P Zero', size: '275/40/18', price: 310
   }, session), true);
+  assert.equal(quotationItemHasEvidence({
+    brand: 'Pirelli', model: 'P Zero', size: '280/40/18', price: 310
+  }, session), false);
+});
+
+test('treats emoji and sticker-only supplier replies as acknowledgements', () => {
+  assert.equal(sessionFor([
+    ['R', '225/45R18 Michelin PS5 have?'],
+    ['S', '225/45R18 Michelin PS5 Y26 $180'],
+    ['S', '👌🏻']
+  ]).reason, 'logistics_or_acknowledgement');
+  assert.equal(sessionFor([
+    ['R', '225/45R18 Michelin PS5 have?'],
+    ['S', '225/45R18 Michelin PS5 Y26 $180'],
+    ['S', '[Sticker]']
+  ]).reason, 'logistics_or_acknowledgement');
 });

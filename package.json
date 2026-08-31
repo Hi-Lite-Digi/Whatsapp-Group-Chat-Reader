@@ -10,6 +10,7 @@
     "build:client": "vite build",
     "build": "npm run build:client",
     "backup": "node scripts/backup-runtime.mjs",
+    "import:web-history": "node scripts/import-web-history.mjs",
     "healthcheck": "node scripts/healthcheck.mjs",
     "test": "node --test",
     "setup": "npm install && npm run build"

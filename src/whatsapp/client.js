@@ -35,6 +35,7 @@ import {
 } from '../oracle/sync.js';
 import { getDisconnectPolicy } from './disconnect-policy.js';
 import { groupJidFrom, groupNameFrom } from './group-discovery.js';
+import { senderIdFromMessage } from './sender-identity.js';
 
 const authFolder = process.env.AUTH_FOLDER || './auth_info';
 if (!fs.existsSync(authFolder)) {
@@ -869,9 +870,7 @@ async function handleIncomingMessage(msg, options = {}) {
 
     const chatId = chatType === 'group' ? remoteJid : chatRecord.id;
     const chatName = chatRecord.name || remoteJid.split('@')[0];
-    const senderId = msg.key.fromMe
-      ? (sock?.user?.id || 'self')
-      : (msg.key.participant || msg.key.participantAlt || remoteJid);
+    const senderId = senderIdFromMessage(msg, sock?.user?.id || 'self');
     const senderName = msg.key.fromMe
       ? (sock?.user?.name || 'You')
       : (msg.pushName || chatRecord.name || senderId.split('@')[0]);

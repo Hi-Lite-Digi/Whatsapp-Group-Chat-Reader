@@ -3,6 +3,7 @@ const BATTERY_PATTERN = /\b(?:battery|batteries|agm|varta|aux\s*\d+|\d{2,3}\s*ah
 const RIM_PATTERN = /\b(?:rim|rims|wheel|wheels|pcd|offset|et\s*\d+)\b/i;
 const LOGISTICS_PATTERN = /\b(?:deliver|delivery|driver|send\s+(?:to|down)|self\s*collect|collect\s+now|prepare|address|lane|road|building|before\s+\d|tomorrow\s+morning)\b/i;
 const ACK_PATTERN = /^(?:ok(?:ay)?|can|thank(?:s|\s+you)?|roger|noted|sure|bro|boss)[\s.!]*$/i;
+const NON_TEXT_ACK_PATTERN = /^(?:[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D\s]+|\[(?:sticker|stickerMessage|reaction)\])$/iu;
 const CONTINUATION_PATTERN = /\b(?:yes|yar|only|left|piece|pieces|pcs?|ready\s+stock|year|model|dot\s*\d{2}|y\s*\d{2}|offer|normal|run\s*flat|runflat|ssr)\b/i;
 
 const BRAND_ALIASES = new Map([
@@ -74,14 +75,14 @@ export function canonicalModel(value) {
 
 export function normalizeTyreSize(value) {
   const input = String(value || '').toUpperCase().trim();
-  const commercial = input.match(/(?:^|\D)(\d{3})\s*[\/-]?\s*R\s*(\d{2})\s*C(?:\D|$)/);
+  const commercial = input.match(/(?:^|\D)(\d{3})[ \t]*[\/-]?[ \t]*R[ \t]*(\d{2})[ \t]*C(?:\D|$)/);
   if (commercial) {
     const width = Number(commercial[1]);
     const rim = Number(commercial[2]);
     if (width >= 125 && width <= 445 && rim >= 10 && rim <= 30) return `${width}R${rim}C`;
   }
 
-  const passenger = input.match(/(?:^|\D)(\d{3})\s*[\/\-\s]\s*(\d{2})\s*(?:[\/\-\s]*(?:ZR|R)?\s*)(\d{2})(?:\D|$)/)
+  const passenger = input.match(/(?:^|\D)(\d{3})[ \t]*(?:[\/-][ \t]*|[ \t]+)(\d{2})[ \t]*(?:(?:[\/-][ \t]*)?(?:ZR|R)[ \t]*|(?:[\/-][ \t]*|[ \t]+))(\d{2})(?:\D|$)/)
     || input.match(/(?:^|\D)(\d{3})(\d{2})(\d{2})(?:\D|$)/);
   if (!passenger) return null;
 
@@ -96,8 +97,8 @@ export function extractTyreSizes(value) {
   const input = String(value || '');
   const candidates = [];
   const patterns = [
-    /\b\d{3}\s*[\/-]?\s*R\s*\d{2}\s*C\b/gi,
-    /\b\d{3}\s*[\/\-\s]\s*\d{2}\s*(?:[\/\-\s]*(?:ZR|R)?\s*)\d{2}\b/gi,
+    /\b\d{3}[ \t]*[\/-]?[ \t]*R[ \t]*\d{2}[ \t]*C\b/gi,
+    /\b\d{3}[ \t]*(?:[\/-][ \t]*|[ \t]+)\d{2}[ \t]*(?:(?:[\/-][ \t]*)?(?:ZR|R)[ \t]*|(?:[\/-][ \t]*|[ \t]+))\d{2}\b/gi,
     /\b\d{7}\b/g
   ];
   for (const pattern of patterns) {
@@ -130,7 +131,7 @@ function isLogisticsOnly(value) {
   const text = String(value || '').trim();
   return !hasSupplierPrice(text)
     && extractTyreSizes(text).length === 0
-    && (LOGISTICS_PATTERN.test(text) || ACK_PATTERN.test(text));
+    && (LOGISTICS_PATTERN.test(text) || ACK_PATTERN.test(text) || NON_TEXT_ACK_PATTERN.test(text));
 }
 
 function isMeaningfulContinuation(value) {
@@ -280,7 +281,9 @@ export function quotationItemHasEvidence(item, session) {
   const supplierText = session.evidence.supplierText;
   const allText = session.messages.map(messageText).join('\n');
   const size = normalizeTyreSize(item?.size);
-  if (!size || !session.evidence.sizes.includes(size)) return false;
+  const supplierSizes = extractTyreSizes(supplierText);
+  const supportedSizes = supplierSizes.length > 0 ? supplierSizes : session.evidence.sizes;
+  if (!size || !supportedSizes.includes(size)) return false;
   if (!priceSupported(item?.price, supplierText)) return false;
 
   return brandSupported(item?.brand, allText) && modelSupported(item?.model, allText);
