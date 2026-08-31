@@ -168,11 +168,16 @@ WantedBy=timers.target
 BACKUP_TIMER
 
 systemctl daemon-reload
-systemctl enable --now mrrjestic-listener.service mrrjestic-backup.timer
+systemctl enable mrrjestic-listener.service
+# The service is Type=oneshot with RemainAfterExit. `enable --now` leaves an
+# already-active deployment on its previous image, so every release must run
+# ExecStop/ExecStart explicitly after release.env is replaced.
+systemctl restart mrrjestic-listener.service
+systemctl enable --now mrrjestic-backup.timer
 
 for attempt in $(seq 1 60); do
-  if curl -fsS http://127.0.0.1:3000/health/live >/dev/null; then
-    printf 'listener_live=true\n'
+  if curl -fsS http://127.0.0.1:3000/health/ready >/dev/null; then
+    printf 'listener_ready=true\n'
     exit 0
   fi
   sleep 2
