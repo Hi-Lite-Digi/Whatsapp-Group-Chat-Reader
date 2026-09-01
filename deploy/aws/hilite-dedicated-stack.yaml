@@ -504,7 +504,7 @@ Resources:
       EnableTokenRevocation: true
       AccessTokenValidity: 1
       IdTokenValidity: 1
-      RefreshTokenValidity: 1
+      RefreshTokenValidity: 30
       TokenValidityUnits:
         AccessToken: hours
         IdToken: hours
@@ -536,7 +536,7 @@ Resources:
             OnUnauthenticatedRequest: authenticate
             Scope: openid email profile
             SessionCookieName: AWSELBAuthSessionCookieWhatsApp
-            SessionTimeout: 3600
+            SessionTimeout: 604800
         - Type: forward
           Order: 2
           TargetGroupArn: !Ref ListenerTargetGroup

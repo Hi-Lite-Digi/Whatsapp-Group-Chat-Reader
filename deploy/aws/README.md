@@ -120,6 +120,8 @@ ssh -L 3000:127.0.0.1:3000 ubuntu@SERVER_IP
 
 Then open `http://127.0.0.1:3000`. For shared access, put the service behind HTTPS and authentication rather than exposing port 3000 directly.
 
+The included HTTPS Application Load Balancer configuration keeps an authenticated dashboard session for seven days. Cognito refresh tokens remain valid for 30 days so the load balancer can renew the one-hour access and ID tokens without interrupting the dashboard's live polling. After seven days, the next full-page navigation asks the administrator to sign in again; WhatsApp listening and server-side quotation processing continue independently of dashboard login state.
+
 ## 5. Start automatically after reboot
 
 ```bash
