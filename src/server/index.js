@@ -419,6 +419,7 @@ app.delete('/api/schemas/:id', (req, res) => {
 
 // Messages & Extractions
 app.get('/api/messages', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   const { groupId, limit = 50, offset = 0, search = '' } = req.query;
   const messages = getMessagesWithExtractions({
     groupId: groupId || null,

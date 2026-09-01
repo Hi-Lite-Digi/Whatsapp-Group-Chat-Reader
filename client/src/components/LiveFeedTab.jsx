@@ -18,30 +18,46 @@ export default function LiveFeedTab({ liveMessages, logs, chats }) {
   const [error, setError] = useState('');
   const [lastUpdated, setLastUpdated] = useState(null);
   const logEndRef = useRef(null);
+  const requestSequenceRef = useRef(0);
 
   const fetchMessages = useCallback(async ({ background = false } = {}) => {
+    const requestSequence = ++requestSequenceRef.current;
     if (!background) setLoading(true);
     setError('');
 
     try {
       const params = new URLSearchParams({ limit: '1000' });
       if (selectedChat) params.set('groupId', selectedChat);
-      const response = await fetch(`/api/messages?${params.toString()}`);
+      const response = await fetch(`/api/messages?${params.toString()}`, { cache: 'no-store' });
       if (!response.ok) throw new Error(`Message history returned ${response.status}`);
       const data = await response.json();
-      setStoredMessages(Array.isArray(data) ? data : []);
-      setLastUpdated(new Date());
+      if (requestSequence === requestSequenceRef.current) {
+        setStoredMessages(Array.isArray(data) ? data : []);
+        setLastUpdated(new Date());
+      }
     } catch (fetchError) {
-      setError(fetchError.message || 'Unable to load stored messages.');
+      if (requestSequence === requestSequenceRef.current) {
+        setError(fetchError.message || 'Unable to load stored messages.');
+      }
     } finally {
-      if (!background) setLoading(false);
+      if (!background && requestSequence === requestSequenceRef.current) setLoading(false);
     }
   }, [selectedChat]);
 
   useEffect(() => {
     fetchMessages();
-    const refreshTimer = setInterval(() => fetchMessages({ background: true }), 15000);
-    return () => clearInterval(refreshTimer);
+    const refresh = () => fetchMessages({ background: true });
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') refresh();
+    };
+    const refreshTimer = setInterval(refresh, 10_000);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    window.addEventListener('focus', refresh);
+    return () => {
+      clearInterval(refreshTimer);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+      window.removeEventListener('focus', refresh);
+    };
   }, [fetchMessages]);
 
   useEffect(() => {

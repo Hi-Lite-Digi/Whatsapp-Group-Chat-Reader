@@ -38,6 +38,7 @@ import {
 import { getDisconnectPolicy } from './disconnect-policy.js';
 import { groupJidFrom, groupNameFrom } from './group-discovery.js';
 import { senderIdFromMessage } from './sender-identity.js';
+import { classifyUpsertMessage, isActiveDeliverySource } from './upsert-delivery.js';
 
 const authFolder = process.env.AUTH_FOLDER || './auth_info';
 if (!fs.existsSync(authFolder)) {
@@ -65,6 +66,7 @@ const RECONNECT_BASE_DELAY_MS = Math.max(1000, Number.parseInt(process.env.WHATS
 const RECONNECT_MAX_DELAY_MS = Math.max(RECONNECT_BASE_DELAY_MS, Number.parseInt(process.env.WHATSAPP_RECONNECT_MAX_DELAY_MS || '300000', 10));
 const RECONNECT_WATCHDOG_MS = Math.max(15000, Number.parseInt(process.env.WHATSAPP_RECONNECT_WATCHDOG_MS || '60000', 10));
 const INITIAL_GROUP_SYNC_DELAY_MS = Math.max(1000, Number.parseInt(process.env.WHATSAPP_INITIAL_GROUP_SYNC_DELAY_MS || '5000', 10));
+const CATCHUP_WINDOW_MS = Math.max(60_000, Number.parseInt(process.env.WHATSAPP_CATCHUP_WINDOW_MS || '86400000', 10));
 const sentMessageCache = new Map();
 const pendingHistoryByGroup = new Map();
 const pendingHistoryByDm = new Map();
@@ -624,9 +626,14 @@ async function initializeWhatsAppClient() {
     });
 
     sock.ev.on('messages.upsert', async (m) => {
-      if (m.type !== 'notify') return;
       for (const msg of m.messages) {
-        await handleIncomingMessage(msg, { source: 'realtime', downloadMedia: true, runExtraction: true });
+        const delivery = classifyUpsertMessage(m.type, msg, { catchupWindowMs: CATCHUP_WINDOW_MS });
+        emitLog(`WhatsApp message event received (${m.type || 'unknown'} → ${delivery.source}).`);
+        await handleIncomingMessage(msg, {
+          source: delivery.source,
+          downloadMedia: delivery.activeDelivery,
+          runExtraction: delivery.activeDelivery
+        });
       }
     });
 
@@ -886,9 +893,10 @@ async function handleIncomingMessage(msg, options = {}) {
   try {
     const {
       source = 'realtime',
-      downloadMedia = source === 'realtime',
-      runExtraction = source === 'realtime'
+      downloadMedia = isActiveDeliverySource(source),
+      runExtraction = isActiveDeliverySource(source)
     } = options;
+    const activeDelivery = isActiveDeliverySource(source);
     if (!msg || !msg.message) return;
     const remoteJid = msg.key.remoteJid;
     const chatType = chatTypeForJid(remoteJid);
@@ -926,7 +934,7 @@ async function handleIncomingMessage(msg, options = {}) {
       return { saved: false, reason: 'duplicate' };
     }
     const timestamp = new Date((msg.messageTimestamp || Date.now() / 1000) * 1000).toISOString();
-    if (source === 'realtime') lastMessageAt = timestamp;
+    if (activeDelivery) lastMessageAt = timestamp;
 
     // Determine message type & text content
     const messageType = Object.keys(msg.message)[0];
@@ -975,7 +983,8 @@ async function handleIncomingMessage(msg, options = {}) {
         : `Supplier image saved, but no readable quotation text was found for ${chatName}.`);
     }
 
-    emitLog(`${source === 'history' ? '🕘 Imported' : '📩 Received'} message from ${senderName} in ${chatType === 'group' ? 'group' : 'DM'} "${chatName}" (${messageType})`);
+    const sourceAction = source === 'history' ? '🕘 Imported' : source === 'catchup' ? '↩️ Recovered' : '📩 Received';
+    emitLog(`${sourceAction} message from ${senderName} in ${chatType === 'group' ? 'group' : 'DM'} "${chatName}" (${messageType})`);
 
     // Save raw message to DB
     const dbMessageId = saveMessage({
@@ -1019,10 +1028,10 @@ async function handleIncomingMessage(msg, options = {}) {
       ioInstance.emit('new_message', fullMsgPayload);
     }
 
-    if (chatType === 'dm' && source === 'realtime') {
+    if (chatType === 'dm' && activeDelivery) {
       void requestHistoryForDm(chatId);
     }
-    if (chatType === 'group' && source === 'realtime') {
+    if (chatType === 'group' && activeDelivery) {
       void requestHistoryForGroup(chatId);
     }
 
@@ -1030,7 +1039,7 @@ async function handleIncomingMessage(msg, options = {}) {
     // not run the generic per-message extractor because it loses fragments
     // and creates duplicate, unrelated extraction records.
     if (chatType === 'group' && chatRecord.oracle_sync_enabled === 1) {
-      if (source === 'realtime') scheduleOracleQuotationCheck(fullMsgPayload, chatRecord);
+      if (activeDelivery) scheduleOracleQuotationCheck(fullMsgPayload, chatRecord);
       return { saved: true, id: dbMessageId };
     }
 
