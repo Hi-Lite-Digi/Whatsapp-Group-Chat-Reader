@@ -78,9 +78,9 @@ This local application links one WhatsApp account, listens only to explicitly se
 2. Open **Monitored Groups**, sync the group list, and select the matching Oracle supplier for each target group.
 3. Enable quotation sync only for verified supplier groups. All other chats remain unread and unstored.
 4. The first relevant exchange opens a persistent quotation case. The 45-second quiet period controls when the case is evaluated; it does not close the case.
-5. Related late fragments can fill missing brand, model, size, or price evidence during the configurable case lifetime (60 minutes by default). Direct WhatsApp replies and the original requester anchor outrank semantic matching; ambiguous matches stop for review.
-6. A complete supplier quote is normalized to brand, model, tyre size, per-piece price, year, origin, stated quantity/availability, match type, and quote date.
-7. The app checks whether the product is an existing Oracle listing with stock, an existing listing without stock, or a new listing.
+5. Related late fragments can fill missing brand, model, size, price, supplier quantity, or confirmed ready-stock evidence during the configurable case lifetime (60 minutes by default). Direct WhatsApp replies and the original requester anchor outrank semantic matching; ambiguous matches stop for review.
+6. A quotation is Oracle-ready only when every item has an evidenced brand, model, tyre size, positive per-piece price, positive supplier stock quantity, and explicit ready-stock confirmation. Preorders and unknown availability remain incomplete.
+7. Immediately before publishing, the app searches Oracle by normalized size + brand + model. It targets the matching tyre record for an update or submits the complete product fields to create a new record when no exact match exists.
 8. By default, the result waits in **Quotation Review Queue**. Press **Publish** only after checking the supplier, tyre, price, and GST convention.
 9. Automatic publishing is a separate setting and should stay off until the real Mrrjestic account and every supplier mapping have been validated.
 
@@ -88,7 +88,7 @@ The current linked account is only a test session. Replacing it removes the loca
 
 ### Oracle API scope
 
-The supplied Oracle contract supports reading new tyres, used tyres, rims, and suppliers. Its write endpoint accepts supplier prices for new tyres only. This pipeline therefore does not claim to update stock quantity, used-tyre inventory, or rim inventory. Those require additional Oracle write endpoints.
+The supplied Oracle contract supports reading new tyres, used tyres, rims, and suppliers. Its write endpoint upserts supplier-price records for new tyres. The listener forwards the supplier's explicitly quoted quantity and availability as quotation metadata and retains both in its audit database; this does not mutate Mrrjestic's own warehouse inventory count. Used-tyre and rim inventory still require separate Oracle write endpoints.
 
 Oracle credentials are read from server-side environment variables and are never returned to the browser:
 
@@ -102,8 +102,8 @@ ORACLE_API_TOKEN=replace_with_api_token
 - Newly discovered groups are paused.
 - Quotation sync requires both monitoring and a valid Oracle supplier mapping.
 - Automatic publishing defaults to off.
-- Duplicate quotations are blocked using a stable supplier/product/price/date fingerprint.
-- Incomplete or low-confidence quotations are rejected, and extracted brand/model/size/price values must be traceable to source messages.
+- Duplicate quotations are blocked using a stable supplier/product/price/quantity/availability/date fingerprint.
+- Incomplete or low-confidence quotations are rejected, and every required value—including supplier quantity and ready-stock confirmation—must be traceable to supplier messages.
 - Fragmented supplier replies are grouped into a bounded quotation session; mapped groups do not use the generic one-message extractor.
 - Incomplete cases persist with their known evidence and explicit missing fields. A later fragment can re-open evaluation even after the quiet-period check has run.
 - Case correlation prioritizes a WhatsApp reply target, the same requester anchor, matching tyre evidence, and recency. Two plausible matches are marked ambiguous rather than guessed.
@@ -111,4 +111,6 @@ ORACLE_API_TOKEN=replace_with_api_token
 - When several supplier fragments settle together, the listener applies the complete batch before automatic publishing. Only candidates still marked ready after corrections and incomplete follow-ups are considered.
 - Realtime supplier images are transcribed before the same quotation evidence checks are applied.
 - The Processing Audit records completed, skipped, and failed checks with source-message counts and reasons.
-- A publish is marked successful only after its returned record ID appears in Oracle API history.
+- Publication performs a fresh exact Oracle record lookup to avoid creating a duplicate while an item waits for review.
+- The server revalidates all mandatory fields at publish time; the dashboard status alone cannot bypass the safety gate.
+- A publish is marked successful only after its returned record ID and approved product/price appear in Oracle API history.

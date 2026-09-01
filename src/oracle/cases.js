@@ -14,6 +14,7 @@ import {
   missingQuotationFields,
   signalsForMessages
 } from './case-correlation.js';
+import { missingOracleReadyFields } from './readiness.js';
 
 const NON_CASE_REASONS = new Set([
   'unsupported_product',
@@ -60,6 +61,8 @@ function relevantForNewCase(session, signals) {
     || signals.prices.length
     || signals.brands.length
     || signals.models.length
+    || signals.quantities.length
+    || signals.availabilities.length
   );
 }
 
@@ -103,12 +106,12 @@ export function resolveQuotationCase({
     requestAnchor: anchor
   });
 
-  const currentSignals = signalsForMessages([message]);
+  const currentSignals = signalsForMessages([message], supplierSenderIds);
   const relevant = relevantForNewCase(creationSession, currentSignals);
   if (decision.outcome === 'ambiguous') {
     if (!relevant) return { caseRecord: null, outcome: 'irrelevant', decision };
     const ambiguousMessages = creationSession?.messages?.length ? creationSession.messages : [message];
-    const signals = signalsForMessages(ambiguousMessages);
+    const signals = signalsForMessages(ambiguousMessages, supplierSenderIds);
     const caseRecord = createOracleQuoteCase({
       account_id: message.account_id,
       group_id: group.id,
@@ -138,7 +141,7 @@ export function resolveQuotationCase({
 
   const messagesToAttach = creationSession?.messages?.length ? creationSession.messages : [message];
   if (!caseRecord) {
-    const signals = signalsForMessages(messagesToAttach);
+    const signals = signalsForMessages(messagesToAttach, supplierSenderIds);
     const missingFields = missingQuotationFields(signals);
     caseRecord = createOracleQuoteCase({
       account_id: message.account_id,
@@ -170,7 +173,7 @@ export function resolveQuotationCase({
   const attachedMessages = getOracleQuoteCaseMessages(caseRecord.id);
   const knownFields = mergeQuotationSignals(
     storedFields(caseRecord),
-    signalsForMessages(attachedMessages)
+    signalsForMessages(attachedMessages, supplierSenderIds)
   );
   const missingFields = missingQuotationFields(knownFields);
   caseRecord = updateOracleQuoteCase(caseRecord.id, {
@@ -201,14 +204,39 @@ export function buildPersistentQuotationSession({ caseRecord, currentMessageId, 
   });
 }
 
-export function markQuotationCaseIncomplete(caseId, reason, session = null) {
+function signalsForQuoteItems(items) {
+  return {
+    sizes: [...new Set((items || []).map(item => item.size).filter(Boolean))],
+    prices: [...new Set((items || []).map(item => item.price).filter(value => Number(value) > 0))],
+    brands: [...new Set((items || []).map(item => item.brand).filter(Boolean))],
+    models: [...new Set((items || []).map(item => item.model).filter(Boolean))],
+    years: [...new Set((items || []).map(item => item.year_of_manufacture).filter(Boolean))],
+    quantities: [...new Set((items || []).map(item => item.stock_quantity).filter(Boolean))],
+    availabilities: [...new Set((items || []).map(item => item.availability).filter(value => value === 'ready_stock'))]
+  };
+}
+
+export function markQuotationCaseIncomplete(
+  caseId,
+  reason,
+  session = null,
+  items = [],
+  requiredMissingFields = []
+) {
   if (!caseId) return null;
   const caseRecord = getOracleQuoteCaseById(caseId);
   if (!caseRecord) return null;
   const attachedMessages = getOracleQuoteCaseMessages(caseId);
-  const signals = signalsForMessages(attachedMessages);
-  const missingFields = missingQuotationFields(signals);
-  const preserveReady = ['ready', 'published'].includes(caseRecord.status);
+  const signals = mergeQuotationSignals(
+    signalsForMessages(attachedMessages),
+    signalsForQuoteItems(items)
+  );
+  const missingFields = [...new Set([
+    ...missingQuotationFields(signals),
+    ...requiredMissingFields
+  ])];
+  const preserveReady = caseRecord.status === 'published'
+    || caseRecord.status === 'ready' && reason !== 'missing_required_fields';
   const changes = {
     status: preserveReady ? caseRecord.status : 'incomplete',
     known_fields_json: signals,
@@ -224,13 +252,7 @@ export function markQuotationCaseIncomplete(caseId, reason, session = null) {
 export function markQuotationCaseReady(caseId, event, items, sourceMessageIds) {
   if (!caseId) return null;
   const caseRecord = getOracleQuoteCaseById(caseId);
-  const itemFields = {
-    sizes: [...new Set(items.map(item => item.size))],
-    prices: [...new Set(items.map(item => item.price))],
-    brands: [...new Set(items.map(item => item.brand))],
-    models: [...new Set(items.map(item => item.model))],
-    years: [...new Set(items.map(item => item.year_of_manufacture).filter(Boolean))]
-  };
+  const itemFields = signalsForQuoteItems(items);
   let previousFields = {};
   try {
     previousFields = typeof caseRecord?.known_fields_json === 'string'
@@ -238,13 +260,16 @@ export function markQuotationCaseReady(caseId, event, items, sourceMessageIds) {
       : caseRecord?.known_fields_json || {};
   } catch {}
   const knownFields = mergeQuotationSignals(previousFields, itemFields);
+  const missingFields = [...new Set(items.flatMap(missingOracleReadyFields))];
   return updateOracleQuoteCase(caseId, {
-    status: event?.sync_status === 'published' ? 'published' : 'ready',
+    status: missingFields.length > 0
+      ? 'incomplete'
+      : event?.sync_status === 'published' ? 'published' : 'ready',
     known_fields_json: knownFields,
-    missing_fields_json: [],
+    missing_fields_json: missingFields,
     source_message_ids: sourceMessageIds,
     current_event_id: event?.id || null,
-    last_reason: null,
+    last_reason: missingFields.length > 0 ? 'missing_required_fields' : null,
     completed_at: event?.sync_status === 'published' ? new Date().toISOString() : null
   });
 }
@@ -261,20 +286,15 @@ export function markQuotationCasePublished(caseId, eventId) {
 
 export function markQuotationCaseDuplicate(caseId, items, sourceMessageIds) {
   if (!caseId) return null;
-  const knownFields = {
-    sizes: [...new Set(items.map(item => item.size))],
-    prices: [...new Set(items.map(item => item.price))],
-    brands: [...new Set(items.map(item => item.brand))],
-    models: [...new Set(items.map(item => item.model))],
-    years: [...new Set(items.map(item => item.year_of_manufacture).filter(Boolean))]
-  };
+  const knownFields = signalsForQuoteItems(items);
+  const missingFields = [...new Set(items.flatMap(missingOracleReadyFields))];
   return updateOracleQuoteCase(caseId, {
-    status: 'duplicate',
+    status: missingFields.length > 0 ? 'incomplete' : 'duplicate',
     known_fields_json: knownFields,
-    missing_fields_json: [],
+    missing_fields_json: missingFields,
     source_message_ids: sourceMessageIds,
     current_event_id: null,
-    last_reason: 'duplicate_quotes',
-    completed_at: new Date().toISOString()
+    last_reason: missingFields.length > 0 ? 'missing_required_fields' : 'duplicate_quotes',
+    completed_at: missingFields.length > 0 ? null : new Date().toISOString()
   });
 }

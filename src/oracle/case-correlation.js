@@ -1,6 +1,22 @@
 import { extractQuotationSignals, normalizeComparable } from './quotation.js';
 
-export const REQUIRED_QUOTATION_FIELDS = Object.freeze(['brand', 'model', 'size', 'price']);
+export const REQUIRED_QUOTATION_FIELDS = Object.freeze([
+  'brand',
+  'model',
+  'size',
+  'price',
+  'quantity',
+  'confirmed_availability'
+]);
+
+const SIGNAL_KEY_BY_FIELD = Object.freeze({
+  brand: 'brands',
+  model: 'models',
+  size: 'sizes',
+  price: 'prices',
+  quantity: 'quantities',
+  confirmed_availability: 'availabilities'
+});
 
 function parseJson(value, fallback) {
   if (value == null || value === '') return fallback;
@@ -35,19 +51,31 @@ export function mergeQuotationSignals(...signals) {
     brands: unique(signals.flatMap(item => item?.brands || []), normalizeComparable),
     models: unique(signals.flatMap(item => item?.models || []), normalizeComparable),
     years: unique(signals.flatMap(item => item?.years || []), value => String(value)),
+    quantities: unique(signals.flatMap(item => item?.quantities || []), value => String(value)),
+    availabilities: unique(signals.flatMap(item => item?.availabilities || []), normalizeComparable),
     looksLikeRequest: signals.some(item => item?.looksLikeRequest === true),
     meaningfulContinuation: signals.some(item => item?.meaningfulContinuation === true)
   };
 }
 
-export function signalsForMessages(messages) {
-  return mergeQuotationSignals(...(messages || []).map(message => extractQuotationSignals(messageText(message))));
+export function signalsForMessages(messages, supplierSenderIds = null) {
+  return mergeQuotationSignals(...(messages || []).map(message => {
+    const signals = extractQuotationSignals(messageText(message));
+    const supplierRoleKnown = message?.role != null || supplierSenderIds instanceof Set;
+    const isSupplier = message?.role === 'supplier'
+      || supplierSenderIds instanceof Set && supplierSenderIds.has(message?.sender_id);
+    if (supplierRoleKnown && !isSupplier) {
+      return { ...signals, quantities: [], availabilities: [] };
+    }
+    return signals;
+  }));
 }
 
 export function missingQuotationFields(signals) {
   const safe = signals || {};
   return REQUIRED_QUOTATION_FIELDS.filter(field => {
-    const key = `${field}s`;
+    const key = SIGNAL_KEY_BY_FIELD[field];
+    if (field === 'confirmed_availability') return !safe[key]?.includes('ready_stock');
     return !Array.isArray(safe[key]) || safe[key].length === 0;
   });
 }
@@ -127,7 +155,10 @@ export function scoreQuotationCase({ caseRecord, currentMessage, requestAnchor =
   }
 
   for (const field of REQUIRED_QUOTATION_FIELDS) {
-    const values = currentSignals[`${field}s`] || [];
+    const rawValues = currentSignals[SIGNAL_KEY_BY_FIELD[field]] || [];
+    const values = field === 'confirmed_availability'
+      ? rawValues.filter(value => value === 'ready_stock')
+      : rawValues;
     if (missing.has(field) && values.length > 0) {
       score += 18;
       reasons.push(`fills_missing_${field}`);
@@ -184,7 +215,8 @@ export function chooseQuotationCase({ cases, currentMessage, requestAnchor = nul
   }
 
   const hasCorrelationSignal = top.currentSignals.meaningfulContinuation
-    || ['sizes', 'prices', 'brands', 'models'].some(key => top.currentSignals[key]?.length > 0);
+    || ['sizes', 'prices', 'brands', 'models', 'quantities', 'availabilities']
+      .some(key => top.currentSignals[key]?.length > 0);
   if (candidates.length > 1 && top.score >= 15 && hasCorrelationSignal && top.conflicts.length === 0) {
     return { outcome: 'ambiguous', candidates: candidates.slice(0, 3) };
   }

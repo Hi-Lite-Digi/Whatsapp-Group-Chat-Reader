@@ -4,6 +4,8 @@ import test from 'node:test';
 import {
   buildQuotationSession,
   canonicalModel,
+  extractConfirmedAvailabilities,
+  extractStockQuantities,
   extractTyreSizes,
   normalizeTyreSize,
   quotationItemHasEvidence
@@ -49,6 +51,33 @@ test('normalizes common supplier model shorthand without confusing PS4 and PS4S'
   assert.equal(canonicalModel('Michelin PS5 XL'), 'pilot sport 5');
   assert.equal(canonicalModel('MICHELIN PILOT SPORT 4S ND0 XL'), 'pilot sport 4s');
   assert.equal(canonicalModel('Bridgestone POTENZA RE71RS XL'), 'potenza re71rs');
+});
+
+test('extracts only explicit supplier quantity and confirmed availability evidence', () => {
+  assert.deepEqual(extractStockQuantities('left 2pcs, ready stock'), [2]);
+  assert.deepEqual(extractStockQuantities('quantity: 4 units'), [4]);
+  assert.deepEqual(extractConfirmedAvailabilities('2pcs ready stock'), ['ready_stock']);
+  assert.deepEqual(extractConfirmedAvailabilities('left 2pcs'), ['ready_stock']);
+  assert.deepEqual(extractConfirmedAvailabilities('stock: 4 units'), ['ready_stock']);
+  assert.deepEqual(extractConfirmedAvailabilities('available now'), ['ready_stock']);
+  assert.deepEqual(extractConfirmedAvailabilities('pre-order, 5 day lead time'), ['preorder']);
+  assert.deepEqual(extractConfirmedAvailabilities('not available'), []);
+  assert.deepEqual(extractConfirmedAvailabilities('$140 dot26'), []);
+});
+
+test('requires extracted quantity and availability claims to be present in supplier evidence', () => {
+  const session = sessionFor([
+    ['R', '225/45R18 Michelin PS5 have?'],
+    ['S', 'Michelin PS5 $180, 2pcs ready stock']
+  ]);
+  assert.equal(quotationItemHasEvidence({
+    brand: 'Michelin', model: 'PS5', size: '225/45/18', price: 180,
+    stock_quantity: 2, availability: 'ready_stock'
+  }, session), true);
+  assert.equal(quotationItemHasEvidence({
+    brand: 'Michelin', model: 'PS5', size: '225/45/18', price: 180,
+    stock_quantity: 4, availability: 'ready_stock'
+  }, session), false);
 });
 
 test('does not assemble a tyre size from digits in separate messages', () => {

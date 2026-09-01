@@ -36,6 +36,10 @@ import {
   quotationCaseLifetimeMinutes,
   resolveQuotationCase
 } from './cases.js';
+import {
+  buildOracleQuotationPayload,
+  missingOracleReadyFields
+} from './readiness.js';
 
 export { normalizeTyreSize } from './quotation.js';
 
@@ -45,19 +49,19 @@ export const QUOTE_SCHEMA = {
   instruction_prompt: `Extract only definite NEW-TYRE supplier quotations from this bounded WhatsApp quotation session.
 Each line labels the sender as SUPPLIER or REQUESTER. Only supplier replies can create quotation items.
 Messages may be informal, abbreviated, multilingual, or split across a short back-and-forth. Combine nearby fragments when the current supplier message completes or corrects the quotation.
-Set current_message_completes_quotation to true only when [CURRENT] adds the final missing fact, confirms a fact requested immediately before it, supplies a complete quotation, or corrects the newest quotation.
-Return an empty items array when the current message does not complete a quotation, stock is unavailable, the discussion is only a request/question, or the product is a battery, rim, service, delivery arrangement, or anything other than a new tyre.
-Never infer a price, brand, model, tyre size, or availability that was not supplied. A bare price can be joined only to the active tyre request in the same short conversation.
+Set current_message_completes_quotation to true only when every item has an evidenced brand, model, tyre size, per-piece price, positive supplier stock quantity, and explicit ready-stock confirmation. A preorder or unknown availability is not Oracle-ready.
+Return definite candidate items with current_message_completes_quotation false when the product and price are evidenced but quantity or ready-stock confirmation is still missing. Return an empty items array when stock is unavailable, the discussion is only a request/question, or the product is a battery, rim, service, delivery arrangement, or anything other than a new tyre.
+Never infer a price, brand, model, tyre size, quantity, or availability that was not supplied. A bare price can be joined only to the active tyre request in the same short conversation.
 Handle multiple tyre-size sections in one supplier message. Associate each model and price with the closest preceding size heading.
 Normalize passenger sizes to WIDTH/PROFILE/RIM, for example 225/45/17. Preserve commercial formats such as 195R15C.
 Treat Y25 and dot25 as 2025, and Y26 and dot26 as 2026.
 Price must be the supplier's per-piece quoted price. A quantity such as 2pcs describes availability, not a multiplier.
 An alternative offered after saying the requested model is unavailable is a valid quotation for the alternative only.
 Set stock_quantity only when a supplier explicitly states a quantity such as "left 1pc" or "4pcs". Otherwise return null.
-Set availability to ready_stock, preorder, or unknown using only explicit supplier wording.
+Set availability to ready_stock only for explicit supplier confirmation such as "ready stock", "in stock", "available now", or "left 2pcs". Use preorder for an explicit preorder and unknown otherwise.
 Set match_type to exact when the item answers the requested model, alternative when offered instead of an unavailable request, or unsolicited for a supplier stock broadcast without a requester anchor.
 The current message is marked [CURRENT]. Prefer corrections and confirmations in the newest messages over older context.
-Confidence must be between 0 and 1. Use less than 0.85 when any required field remains ambiguous.`,
+Confidence must be between 0 and 1. Missing quantity or availability should remain null/unknown rather than being invented; lower confidence only when an extracted value is ambiguous.`,
   json_schema: JSON.stringify({
     is_supplier_quotation: 'boolean',
     current_message_completes_quotation: 'boolean',
@@ -106,6 +110,13 @@ function normalizeText(value) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
+}
+
+function normalizeOracleBrand(value) {
+  const withoutSupplierPrefix = String(value || '')
+    .replace(/^\s*\([^)]*\)\s*#+\s*/i, '')
+    .replace(/^\s*#+\s*/, '');
+  return normalizeText(canonicalBrand(withoutSupplierPrefix));
 }
 
 function isoDate(value, fallback) {
@@ -161,6 +172,8 @@ function payloadHash(supplierCode, item) {
     normalizeText(item.model),
     item.size,
     item.price.toFixed(2),
+    item.stock_quantity || '',
+    item.availability || 'unknown',
     item.year_of_manufacture || '',
     normalizeText(item.country_of_origin),
     item.quoted_at
@@ -178,14 +191,22 @@ export function findSupersededCaseEvent(priorCaseEvents, item, nextPayloadHash) 
   ) || null;
 }
 
-function exactListing(rows, item) {
-  const brand = normalizeText(item.brand);
+export function findExactOracleListing(rows, item, supplierCode = '') {
+  const brand = normalizeOracleBrand(item.brand);
   const model = normalizeText(canonicalModel(item.model));
-  return rows.find(row =>
+  const matches = (rows || []).filter(row =>
     normalizeTyreSize(row.size) === item.size &&
-    normalizeText(row.brand) === brand &&
+    normalizeOracleBrand(row.brand) === brand &&
     normalizeText(canonicalModel(row.model)) === model
-  ) || null;
+  );
+  return matches.sort((left, right) => {
+    const leftSameSupplier = normalizeText(left.supplier_code) === normalizeText(supplierCode) ? 1 : 0;
+    const rightSameSupplier = normalizeText(right.supplier_code) === normalizeText(supplierCode) ? 1 : 0;
+    if (leftSameSupplier !== rightSameSupplier) return rightSameSupplier - leftSameSupplier;
+    const leftHasTyreId = left.tyre_id ? 1 : 0;
+    const rightHasTyreId = right.tyre_id ? 1 : 0;
+    return rightHasTyreId - leftHasTyreId;
+  })[0] || null;
 }
 
 export function supplierSenderIdsForGroup(group) {
@@ -211,32 +232,55 @@ export function contextForGroup(groupId, currentMessageId, limit, windowMinutes,
   return session.eligible ? formatQuotationContext(session, supplierSenderIds) : '';
 }
 
-async function classifyListing(item) {
+async function classifyListing(item, supplierCode) {
   // Search by normalized size, then match brand/model locally. Supplier model
   // strings often include XL, homologation, load, origin, or date-code suffixes.
   const rows = await searchOracleNewTyres(item.size);
-  const match = exactListing(rows, item);
+  const match = findExactOracleListing(rows, item, supplierCode);
   return {
     listingStatus: match ? (Number(match.qty) > 0 ? 'existing_with_stock' : 'existing_no_stock') : 'new_listing',
+    listingAction: match ? 'update_existing' : 'create_new',
     existingMatch: match
   };
 }
 
-function oraclePayload(item) {
+function itemForEvent(event) {
+  let storedPayload = {};
+  try { storedPayload = JSON.parse(event?.request_payload || '{}'); } catch {}
   return {
-    brand: item.brand,
-    model: item.model,
-    size: item.size,
-    price: item.price,
-    ...(item.year_of_manufacture ? { year_of_manufacture: item.year_of_manufacture } : {}),
-    ...(item.country_of_origin ? { country_of_origin: item.country_of_origin } : {}),
-    is_commercial: item.is_commercial,
-    quoted_at: item.quoted_at
+    brand: event.brand,
+    model: event.model,
+    size: normalizeTyreSize(event.size),
+    price: Number(event.price),
+    stock_quantity: Number(event.stock_quantity),
+    availability: event.availability,
+    year_of_manufacture: event.year_of_manufacture,
+    country_of_origin: event.country_of_origin,
+    is_commercial: storedPayload.is_commercial === true,
+    quoted_at: event.quoted_at
   };
 }
 
 async function publishEvent(event) {
-  const payload = JSON.parse(event.request_payload);
+  const item = itemForEvent(event);
+  const missing = missingOracleReadyFields(item);
+  if (missing.length > 0) {
+    throw new Error(`Quotation cannot be published: missing ${missing.join(', ')}.`);
+  }
+
+  // Recheck Oracle immediately before the write so a record created after the
+  // review event was captured is updated instead of duplicated.
+  const resolution = await classifyListing(item, event.supplier_code);
+  const tyreId = resolution.existingMatch?.tyre_id || null;
+  const payload = buildOracleQuotationPayload(item, { tyreId });
+  updateOracleSyncEvent(event.id, {
+    listing_status: resolution.listingStatus,
+    listing_action: resolution.listingAction,
+    oracle_tyre_id: tyreId,
+    oracle_match_record_id: resolution.existingMatch?.id || null,
+    request_payload: JSON.stringify(payload),
+    error_message: null
+  });
   const response = await publishOraclePrices(event.supplier_code, [payload]);
   const oraclePriceId = Array.isArray(response?.ids) ? response.ids[0] : null;
   if (!oraclePriceId) throw new Error('Oracle accepted the request but did not return a price record ID.');
@@ -249,10 +293,47 @@ async function publishEvent(event) {
   }
   if (!verifiedRecord) throw new Error('Oracle returned an ID, but the new price could not be verified in API history.');
 
+  const verifiedItem = itemForEvent(verifiedRecord);
+  const verifiedPrices = [
+    verifiedRecord.price,
+    verifiedRecord.cost_excl_gst,
+    verifiedRecord.cost_incl_gst
+  ].map(Number).filter(Number.isFinite);
+  if (
+    normalizeText(verifiedItem.brand) !== normalizeText(item.brand)
+    || normalizeText(canonicalModel(verifiedItem.model)) !== normalizeText(canonicalModel(item.model))
+    || verifiedItem.size !== item.size
+    || !verifiedPrices.includes(item.price)
+  ) {
+    throw new Error('Oracle returned a record ID, but the verified record does not match the approved quotation.');
+  }
+
+  let resolvedListing = null;
+  for (let attempt = 0; attempt < 3 && !resolvedListing; attempt++) {
+    if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 500));
+    const rows = await searchOracleNewTyres(item.size);
+    resolvedListing = findExactOracleListing(rows, item, event.supplier_code);
+  }
+  if (!resolvedListing) {
+    throw new Error('Oracle stored the price, but the updated or newly created tyre record could not be resolved.');
+  }
+  if (tyreId && resolvedListing.tyre_id && resolvedListing.tyre_id !== tyreId) {
+    throw new Error('Oracle stored the price against a different tyre record than the approved existing match.');
+  }
+
   updateOracleSyncEvent(event.id, {
     sync_status: 'published',
     oracle_price_id: oraclePriceId,
-    response_json: JSON.stringify({ publish: response, verified: verifiedRecord }),
+    oracle_tyre_id: resolvedListing.tyre_id || tyreId,
+    oracle_match_record_id: resolvedListing.id || resolution.existingMatch?.id || null,
+    response_json: JSON.stringify({
+      action: resolution.listingAction,
+      matched_record_id: resolution.existingMatch?.id || null,
+      tyre_id: tyreId,
+      resolved_listing: resolvedListing,
+      publish: response,
+      verified: verifiedRecord
+    }),
     error_message: null
   });
   const publishedEvent = getOracleSyncEventById(event.id);
@@ -264,6 +345,15 @@ export async function publishOracleSyncEvent(id) {
   const event = getOracleSyncEventById(id);
   if (!event) throw new Error('Quotation sync record not found.');
   if (event.sync_status === 'published') return event;
+  const missing = missingOracleReadyFields(itemForEvent(event));
+  if (missing.length > 0) {
+    updateOracleSyncEvent(event.id, {
+      sync_status: 'incomplete',
+      error_message: `Missing required quotation fields: ${missing.join(', ')}`
+    });
+    markQuotationCaseIncomplete(event.case_id, 'missing_required_fields', null, [], missing);
+    throw new Error(`Quotation cannot be published: missing ${missing.join(', ')}.`);
+  }
   if (event.sync_status !== 'ready' && event.sync_status !== 'failed') {
     throw new Error(`Quotation cannot be published from status ${event.sync_status}.`);
   }
@@ -371,31 +461,6 @@ export async function processOracleGroupMessage({ message, group, allowAutoPubli
     caseRecord = markQuotationCaseIncomplete(caseRecord?.id, 'llm_failure', session) || caseRecord;
     return { extraction, events: [], error, run: updatedRun, case: caseRecord };
     }
-    if (extraction.extractedData?.current_message_completes_quotation !== true) {
-    const updatedRun = updateOracleQuoteRun(run.id, {
-      status: 'skipped',
-      reason: 'incomplete_or_irrelevant',
-      extraction_json: extraction.extractedData
-    });
-    caseRecord = markQuotationCaseIncomplete(caseRecord?.id, 'incomplete_or_irrelevant', session) || caseRecord;
-    return { extraction, events: [], skipped: 'incomplete_or_irrelevant', run: updatedRun, case: caseRecord };
-    }
-
-    const supplierCode = String(group.oracle_supplier_code).trim().toUpperCase();
-    const suppliers = await getOracleSuppliers();
-    const supplier = suppliers.find(item => String(item.code).toUpperCase() === supplierCode);
-    if (!supplier) {
-    const error = `Oracle supplier ${supplierCode} is not valid.`;
-    const updatedRun = updateOracleQuoteRun(run.id, {
-      status: 'failed',
-      reason: 'invalid_supplier_mapping',
-      extraction_json: extraction.extractedData,
-      error_message: error
-    });
-    caseRecord = markQuotationCaseIncomplete(caseRecord?.id, 'invalid_supplier_mapping', session) || caseRecord;
-    return { extraction, events: [], error, run: updatedRun, case: caseRecord };
-    }
-
     const rawItems = Array.isArray(extraction.extractedData?.items) ? extraction.extractedData.items : [];
     const fallbackDate = message.timestamp || new Date().toISOString();
     const normalizedItems = rawItems.map(item => normalizeQuoteItem(item, fallbackDate)).filter(Boolean);
@@ -425,13 +490,51 @@ export async function processOracleGroupMessage({ message, group, allowAutoPubli
       case: caseRecord
     };
     }
+    const missingByItem = items.map(item => missingOracleReadyFields(item));
+    const missingFields = [...new Set(missingByItem.flat())];
+    if (
+      extraction.extractedData?.current_message_completes_quotation !== true
+      || missingFields.length > 0
+    ) {
+    const reason = missingFields.length > 0 ? 'missing_required_fields' : 'incomplete_or_irrelevant';
+    const updatedRun = updateOracleQuoteRun(run.id, {
+      status: 'skipped',
+      reason,
+      extraction_json: extraction.extractedData
+    });
+    caseRecord = markQuotationCaseIncomplete(caseRecord?.id, reason, session, items, missingFields) || caseRecord;
+    return {
+      extraction,
+      events: [],
+      skipped: reason,
+      missing_fields: missingFields,
+      run: updatedRun,
+      case: caseRecord
+    };
+    }
+
+    const supplierCode = String(group.oracle_supplier_code).trim().toUpperCase();
+    const suppliers = await getOracleSuppliers();
+    const supplier = suppliers.find(item => String(item.code).toUpperCase() === supplierCode);
+    if (!supplier) {
+    const error = `Oracle supplier ${supplierCode} is not valid.`;
+    const updatedRun = updateOracleQuoteRun(run.id, {
+      status: 'failed',
+      reason: 'invalid_supplier_mapping',
+      extraction_json: extraction.extractedData,
+      error_message: error
+    });
+    caseRecord = markQuotationCaseIncomplete(caseRecord?.id, 'invalid_supplier_mapping', session, items) || caseRecord;
+    return { extraction, events: [], error, run: updatedRun, case: caseRecord };
+    }
     const events = [];
     const duplicateEvents = [];
     const priorCaseEvents = caseRecord?.id ? getOracleSyncEventsForCase(caseRecord.id) : [];
 
     for (const item of items) {
-    const { listingStatus } = await classifyListing(item);
-    const payload = oraclePayload(item);
+    const { listingStatus, listingAction, existingMatch } = await classifyListing(item, supplierCode);
+    const tyreId = existingMatch?.tyre_id || null;
+    const payload = buildOracleQuotationPayload(item, { tyreId });
     const hash = payloadHash(supplierCode, item);
     const priorEvent = findSupersededCaseEvent(priorCaseEvents, item, hash);
     const event = createOracleSyncEvent({
@@ -441,6 +544,7 @@ export async function processOracleGroupMessage({ message, group, allowAutoPubli
       supplier_name: supplier.name,
       payload_hash: hash,
       listing_status: listingStatus,
+      listing_action: listingAction,
       sync_status: 'ready',
       brand: item.brand,
       model: item.model,
@@ -456,6 +560,8 @@ export async function processOracleGroupMessage({ message, group, allowAutoPubli
       source_message_ids: messageIds,
       case_id: caseRecord?.id || null,
       supersedes_event_id: priorEvent?.id || null,
+      oracle_tyre_id: tyreId,
+      oracle_match_record_id: existingMatch?.id || null,
       request_payload: JSON.stringify(payload)
     });
 
@@ -464,7 +570,7 @@ export async function processOracleGroupMessage({ message, group, allowAutoPubli
       if (duplicateEvent) duplicateEvents.push(duplicateEvent);
       continue;
     }
-    if (priorEvent && ['ready', 'failed'].includes(priorEvent.sync_status)) {
+    if (priorEvent && ['ready', 'failed', 'incomplete'].includes(priorEvent.sync_status)) {
       updateOracleSyncEvent(priorEvent.id, {
         sync_status: 'superseded',
         superseded_by_event_id: event.id,

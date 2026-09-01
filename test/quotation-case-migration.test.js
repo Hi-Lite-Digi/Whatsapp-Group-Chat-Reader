@@ -77,6 +77,17 @@ test('upgrades the pre-case SQLite schema without deleting existing records', as
       'conversation', '$180', 'realtime', 'group',
       'listener@s.whatsapp.net', '2026-08-25T02:00:00.000Z'
     );
+    INSERT INTO oracle_sync_events (
+      message_id, group_id, supplier_code, payload_hash, listing_status,
+      sync_status, brand, model, size, price, quoted_at, stock_quantity,
+      availability, request_payload
+    ) VALUES
+      (1, 'legacy@g.us', 'TO', 'missing-stock', 'new_listing', 'ready',
+        'Falken', 'Azenis FK520L', '225/45/18', 130, '2026-08-25', NULL,
+        'unknown', '{}'),
+      (1, 'legacy@g.us', 'TO', 'complete-stock', 'new_listing', 'ready',
+        'Falken', 'Azenis FK520L', '225/45/18', 130, '2026-08-25', 2,
+        'ready_stock', '{}');
   `);
   legacy.close();
 
@@ -92,9 +103,36 @@ test('upgrades the pre-case SQLite schema without deleting existing records', as
     assert.ok(messageColumns.includes('reply_to_wa_message_id'));
     assert.ok(eventColumns.includes('case_id'));
     assert.ok(eventColumns.includes('supersedes_event_id'));
+    assert.ok(eventColumns.includes('oracle_tyre_id'));
+    assert.ok(eventColumns.includes('oracle_match_record_id'));
+    assert.ok(eventColumns.includes('listing_action'));
     assert.ok(runColumns.includes('case_id'));
     assert.equal(caseTable.name, 'oracle_quote_cases');
     assert.equal(database.db.prepare('SELECT COUNT(*) AS count FROM messages WHERE wa_message_id = ?').get('legacy-message').count, 1);
+    assert.equal(database.db.prepare('SELECT sync_status FROM oracle_sync_events WHERE payload_hash = ?').get('missing-stock').sync_status, 'incomplete');
+    assert.equal(database.db.prepare('SELECT sync_status FROM oracle_sync_events WHERE payload_hash = ?').get('complete-stock').sync_status, 'ready');
+    database.setActiveWhatsappAccount('listener@s.whatsapp.net');
+    database.upsertGroup('legacy@g.us', 'Legacy Group', 'listener@s.whatsapp.net');
+    const quoteCase = database.createOracleQuoteCase({
+      account_id: 'listener@s.whatsapp.net',
+      group_id: 'legacy@g.us',
+      supplier_code: 'TO',
+      status: 'ready',
+      known_fields_json: {
+        sizes: ['225/45/18'], brands: ['Falken'], models: ['Azenis FK520L'], prices: [130]
+      },
+      missing_fields_json: [],
+      opened_at: '2026-08-25T02:00:00.000Z',
+      last_activity_at: '2026-08-25T02:00:00.000Z',
+      expires_at: '2026-08-25T03:00:00.000Z'
+    });
+    database.db.prepare(`
+      UPDATE oracle_sync_events SET sync_status = 'ready', case_id = ? WHERE payload_hash = 'missing-stock'
+    `).run(quoteCase.id);
+    assert.equal(database.reconcileOracleReadinessRecords(), 1);
+    const reconciledCase = database.getOracleQuoteCaseById(quoteCase.id);
+    assert.equal(reconciledCase.status, 'incomplete');
+    assert.deepEqual(JSON.parse(reconciledCase.missing_fields_json), ['quantity', 'confirmed_availability']);
     assert.equal(database.getSettings().oracle_case_lifetime_minutes, '60');
     assert.equal(database.db.pragma('integrity_check', { simple: true }), 'ok');
   } finally {

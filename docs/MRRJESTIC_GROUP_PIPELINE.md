@@ -27,12 +27,12 @@ The first Tyres Online records are two image listings at 13:53, followed by the 
 
 | Pattern | Example shape | Pipeline behavior |
 | --- | --- | --- |
-| Complete quote | size + model + `$price` + year in one reply | Create one review record. |
-| Fragmented quote | `$235` → `PS5` → `Yes` after a 2026 question | Join the bounded exchange and create one record only after it settles. |
+| Complete quote | size + model + `$price` + quantity + `ready stock` in one reply | Create one review record. |
+| Fragmented quote | `$235` → `PS5` → `2pcs ready stock` | Join the persistent case and create one record only after all mandatory facts arrive. |
 | Multi-size block | size heading followed by several models, then another size heading | Associate each model with its nearest size heading. |
 | Requested item unavailable | `no`, followed by another model and price | Ignore the unavailable item and record only explicit alternatives. |
-| Stock broadcast | Unprompted size/model/price list | Record explicit items as unsolicited supplier stock quotations. |
-| Quantity fragment | `left 1pc only $165` | Store quantity as availability evidence; keep `$165` as the per-piece price. |
+| Stock broadcast | Unprompted size/model/price/quantity/availability list | Record only explicit, complete items as unsolicited supplier stock quotations. |
+| Quantity fragment | `left 1pc only, ready stock` | Attach it to the open case as quantity and confirmed availability evidence; retain the earlier per-piece price. |
 | Supplier image | Screenshot/photo containing readable listings | Transcribe visible text, then apply the same evidence and validation rules. |
 | Order or logistics | `send 2pc`, address, driver, collection, thanks | Store the chat message but do not create a quotation update. |
 | Unsupported product | Battery, rim, service, or delivery quote | Store the chat message but do not send it to the new-tyre write endpoint. |
@@ -46,14 +46,16 @@ The first Tyres Online records are two image listings at 13:53, followed by the 
 5. Keep incomplete cases active for a configurable lifetime (60 minutes by default), retaining known evidence, missing fields, source messages, and the correlation audit. If two cases are plausible, create an ambiguous review case and do not extract or publish.
 6. Build the extraction session from the messages attached to the matched case, including relevant evidence older than the short quiet-period context.
 7. For supplier images, transcribe only visible text and retain it with the message before quotation extraction.
-8. Extract only a complete new-tyre quotation that the latest supplier message completes or corrects.
-9. Require source evidence for tyre size, supplier price, brand, and model. Reject any generated value that cannot be traced to the case.
+8. Retain definite partial candidates, but mark a quotation complete only when the latest supplier message supplies or corrects the final mandatory fact.
+9. Require source evidence for tyre size, supplier price, brand, model, positive supplier quantity, and explicit ready-stock availability. Reject any generated value that cannot be traced to the case.
 10. Reject negative availability, incomplete requests, requester messages, batteries, rims, services, and delivery-only discussion.
 11. Normalize size, per-piece price, year, country, quantity, availability, and exact/alternative/broadcast match type.
-12. Search Oracle by size, then match normalized brand/model aliases such as `PS5` and descriptive suffixes such as `XL` locally.
-13. Place the structured event in the review queue. A correction supersedes an unpublished event for the same case and product. When several fragments settle together, apply the full batch before considering automatic publishing. Automatic publishing remains disabled unless explicitly enabled.
-14. Record every settled processing decision in the audit view, including skipped and failed checks with source message IDs and case ID.
-15. When publishing is enabled or staff approves an event, write it through Oracle's supplier-price endpoint and verify that the returned record appears in API history.
+12. Search Oracle by size, then require a normalized brand/model match and prefer the mapped supplier's existing record.
+13. Classify the operation as `update_existing` or `create_new` and retain the matched Oracle record and tyre IDs in the audit row.
+14. Place the structured event in the review queue. A correction supersedes an unpublished event for the same case and product. When several fragments settle together, apply the full batch before considering automatic publishing. Automatic publishing remains disabled unless explicitly enabled.
+15. Record every settled processing decision in the audit view, including skipped and failed checks with source message IDs and case ID.
+16. Immediately before automatic or manual publishing, repeat the exact Oracle lookup and mandatory-field validation, then write through Oracle's supplier-price upsert endpoint.
+17. Verify that the returned record ID resolves to the approved size, brand, model, and quoted price in Oracle API history.
 
 ## Safety rules
 
@@ -61,7 +63,7 @@ The first Tyres Online records are two image listings at 13:53, followed by the 
 - Imported history is stored for context and analysis but is not replayed into Oracle automatically.
 - A quiet period prevents premature evaluation while fragments are arriving; it does not discard an incomplete case.
 - A finite case lifetime prevents old evidence from remaining eligible indefinitely. Conflicting request anchors and product evidence force a new or ambiguous case rather than an unsafe merge.
-- Brand, model, size, and price must all pass deterministic source-evidence checks after model extraction.
+- Brand, model, size, price, supplier quantity, and ready-stock availability must all pass deterministic source-evidence checks after model extraction.
 - Generic per-message extraction is disabled for mapped quotation groups; only the settled, conversation-aware pipeline processes them.
 - Oracle read requests retry temporary rate limits and service failures. Price writes are never blindly retried because a timed-out write may already have succeeded.
 - Oracle credentials remain server-side and are never returned to the browser.

@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
+import { missingOracleReadyFields } from '../oracle/readiness.js';
 
 dotenv.config();
 
@@ -121,6 +122,9 @@ export function initDatabase() {
       case_id INTEGER,
       supersedes_event_id INTEGER,
       superseded_by_event_id INTEGER,
+      oracle_tyre_id TEXT,
+      oracle_match_record_id TEXT,
+      listing_action TEXT,
       oracle_price_id TEXT,
       request_payload TEXT NOT NULL,
       response_json TEXT,
@@ -241,7 +245,10 @@ export function initDatabase() {
     ['source_message_ids', 'TEXT'],
     ['case_id', 'INTEGER'],
     ['supersedes_event_id', 'INTEGER'],
-    ['superseded_by_event_id', 'INTEGER']
+    ['superseded_by_event_id', 'INTEGER'],
+    ['oracle_tyre_id', 'TEXT'],
+    ['oracle_match_record_id', 'TEXT'],
+    ['listing_action', 'TEXT']
   ]) {
     if (!oracleEventColumns.some(column => column.name === name)) {
       db.exec(`ALTER TABLE oracle_sync_events ADD COLUMN ${name} ${type}`);
@@ -262,6 +269,45 @@ export function initDatabase() {
 
   seedDefaultSchemas();
   seedDefaultSettings();
+  reconcileOracleReadinessRecords();
+}
+
+export function reconcileOracleReadinessRecords() {
+  const candidates = db.prepare(`
+    SELECT id, case_id, brand, model, size, price, stock_quantity, availability
+    FROM oracle_sync_events
+    WHERE sync_status IN ('ready', 'failed')
+  `).all();
+  const updateEvent = db.prepare(`
+    UPDATE oracle_sync_events
+    SET sync_status = 'incomplete', error_message = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `);
+  const getCase = db.prepare('SELECT id, status, missing_fields_json FROM oracle_quote_cases WHERE id = ?');
+  const updateCase = db.prepare(`
+    UPDATE oracle_quote_cases
+    SET status = 'incomplete', missing_fields_json = ?, last_reason = 'missing_required_fields',
+      completed_at = NULL, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND status <> 'published'
+  `);
+
+  let changed = 0;
+  const reconcile = db.transaction(() => {
+    for (const event of candidates) {
+      const missing = missingOracleReadyFields(event);
+      if (missing.length === 0) continue;
+      updateEvent.run(`Missing required quotation fields: ${missing.join(', ')}`, event.id);
+      changed += 1;
+      if (!event.case_id) continue;
+      const caseRecord = getCase.get(event.case_id);
+      if (!caseRecord || caseRecord.status === 'published') continue;
+      let priorMissing = [];
+      try { priorMissing = JSON.parse(caseRecord.missing_fields_json || '[]'); } catch {}
+      updateCase.run(JSON.stringify([...new Set([...priorMissing, ...missing])]), caseRecord.id);
+    }
+  });
+  reconcile();
+  return changed;
 }
 
 function seedDefaultSchemas() {
@@ -825,8 +871,9 @@ export function createOracleSyncEvent(event) {
       listing_status, sync_status, brand, model, size, price,
       year_of_manufacture, country_of_origin, quoted_at, confidence,
       stock_quantity, availability, match_type, source_message_ids,
-      case_id, supersedes_event_id, request_payload
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      case_id, supersedes_event_id, oracle_tyre_id, oracle_match_record_id,
+      listing_action, request_payload, error_message
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const result = stmt.run(
     event.message_id,
@@ -850,7 +897,11 @@ export function createOracleSyncEvent(event) {
     event.source_message_ids ? JSON.stringify(event.source_message_ids) : null,
     event.case_id || null,
     event.supersedes_event_id || null,
-    event.request_payload
+    event.oracle_tyre_id || null,
+    event.oracle_match_record_id || null,
+    event.listing_action || null,
+    event.request_payload,
+    event.error_message || null
   );
   if (result.changes === 0) return null;
   return getOracleSyncEventById(Number(result.lastInsertRowid));
@@ -959,7 +1010,12 @@ export function updateOracleSyncEvent(id, changes) {
     'oracle_price_id',
     'response_json',
     'error_message',
-    'superseded_by_event_id'
+    'superseded_by_event_id',
+    'listing_status',
+    'oracle_tyre_id',
+    'oracle_match_record_id',
+    'listing_action',
+    'request_payload'
   ];
   const entries = Object.entries(changes).filter(([key]) => allowed.includes(key));
   if (entries.length === 0) return getOracleSyncEventById(id);

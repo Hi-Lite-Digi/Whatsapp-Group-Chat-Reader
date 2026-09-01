@@ -4,7 +4,9 @@ const RIM_PATTERN = /\b(?:rim|rims|wheel|wheels|pcd|offset|et\s*\d+)\b/i;
 const LOGISTICS_PATTERN = /\b(?:deliver|delivery|driver|send\s+(?:to|down)|self\s*collect|collect\s+now|prepare|address|lane|road|building|before\s+\d|tomorrow\s+morning)\b/i;
 const ACK_PATTERN = /^(?:ok(?:ay)?|can|thank(?:s|\s+you)?|roger|noted|sure|bro|boss)[\s.!]*$/i;
 const NON_TEXT_ACK_PATTERN = /^(?:[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D\s]+|\[(?:sticker|stickerMessage|reaction)\])$/iu;
-const CONTINUATION_PATTERN = /\b(?:yes|yar|only|left|piece|pieces|pcs?|ready\s+stock|year|model|dot\s*\d{2}|y\s*\d{2}|offer|normal|run\s*flat|runflat|ssr)\b/i;
+const CONTINUATION_PATTERN = /\b(?:yes|yar|only|left|piece|pieces|pcs?|units?|ready\s+stock|in\s+stock|available|pre-?order|year|model|dot\s*\d{2}|y\s*\d{2}|offer|normal|run\s*flat|runflat|ssr)\b/i;
+const READY_STOCK_PATTERN = /\b(?:ready\s*stock|in\s*stock|stock\s+(?:is\s+)?available|available(?:\s+(?:now|stock))?|have\s+stock|got\s+stock|(?:stock|left)\s*[:=]?\s*\d{1,3}\s*(?:pcs?|pieces?|units?))\b/i;
+const PREORDER_PATTERN = /\b(?:pre-?order|indent(?:\s+order)?|order\s+basis|lead\s+time)\b/i;
 
 const BRAND_ALIASES = new Map([
   ['co', 'Continental'],
@@ -123,6 +125,31 @@ export function extractSupplierPrices(value) {
   return prices;
 }
 
+export function extractStockQuantities(value) {
+  const quantities = [];
+  const text = String(value || '');
+  const patterns = [
+    /\b(\d{1,3})\s*(?:pcs?|pieces?|units?)\b/gi,
+    /\b(?:qty|quantity)\s*[:=x-]?\s*(\d{1,3})\b/gi,
+    /\b(?:left|stock)\s*[:=x-]?\s*(\d{1,3})\b/gi
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const quantity = Number(match[1]);
+      if (Number.isInteger(quantity) && quantity > 0 && !quantities.includes(quantity)) quantities.push(quantity);
+    }
+  }
+  return quantities;
+}
+
+export function extractConfirmedAvailabilities(value) {
+  const text = String(value || '');
+  const availabilities = [];
+  if (!NEGATIVE_PATTERN.test(text) && READY_STOCK_PATTERN.test(text)) availabilities.push('ready_stock');
+  if (PREORDER_PATTERN.test(text)) availabilities.push('preorder');
+  return availabilities;
+}
+
 function normalizedPhrasePresent(value, phrase) {
   const source = normalizeComparable(value);
   const candidate = normalizeComparable(phrase);
@@ -165,6 +192,8 @@ export function extractQuotationSignals(value) {
     brands,
     models,
     years,
+    quantities: extractStockQuantities(text),
+    availabilities: extractConfirmedAvailabilities(text),
     looksLikeRequest: looksLikeTyreRequest(text),
     meaningfulContinuation: isMeaningfulContinuation(text)
   };
@@ -333,6 +362,16 @@ function brandSupported(brand, allText) {
   return false;
 }
 
+function quantitySupported(quantity, supplierText) {
+  const expected = Number(quantity);
+  return Number.isInteger(expected) && expected > 0 && extractStockQuantities(supplierText).includes(expected);
+}
+
+function availabilitySupported(availability, supplierText) {
+  if (!availability || availability === 'unknown') return true;
+  return extractConfirmedAvailabilities(supplierText).includes(availability);
+}
+
 export function quotationItemHasEvidence(item, session) {
   const supplierText = session.evidence.supplierText;
   const allText = session.messages.map(messageText).join('\n');
@@ -341,6 +380,8 @@ export function quotationItemHasEvidence(item, session) {
   const supportedSizes = supplierSizes.length > 0 ? supplierSizes : session.evidence.sizes;
   if (!size || !supportedSizes.includes(size)) return false;
   if (!priceSupported(item?.price, supplierText)) return false;
+  if (item?.stock_quantity != null && !quantitySupported(item.stock_quantity, supplierText)) return false;
+  if (!availabilitySupported(item?.availability, supplierText)) return false;
 
   return brandSupported(item?.brand, allText) && modelSupported(item?.model, allText);
 }

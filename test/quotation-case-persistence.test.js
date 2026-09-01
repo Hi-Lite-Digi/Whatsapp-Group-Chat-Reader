@@ -64,7 +64,11 @@ test('re-opens an incomplete case when a related fragment arrives outside the qu
       settings
     });
     assert.equal(firstResolution.caseRecord.status, 'incomplete');
-    assert.deepEqual(JSON.parse(firstResolution.caseRecord.missing_fields_json), ['model']);
+    assert.deepEqual(JSON.parse(firstResolution.caseRecord.missing_fields_json), [
+      'model',
+      'quantity',
+      'confirmed_availability'
+    ]);
 
     const modelId = database.saveMessage({
       wa_message_id: 'supplier-model', group_id: group.id, group_name: group.name,
@@ -100,19 +104,57 @@ test('re-opens an incomplete case when a related fragment arrives outside the qu
 
     assert.equal(secondResolution.outcome, 'matched');
     assert.equal(secondResolution.caseRecord.id, firstResolution.caseRecord.id);
-    assert.deepEqual(JSON.parse(secondResolution.caseRecord.missing_fields_json), []);
+    assert.deepEqual(JSON.parse(secondResolution.caseRecord.missing_fields_json), [
+      'quantity',
+      'confirmed_availability'
+    ]);
+
+    const stockId = database.saveMessage({
+      wa_message_id: 'supplier-stock', group_id: group.id, group_name: group.name,
+      sender_id: 'supplier@s.whatsapp.net', sender_name: 'Supplier',
+      message_type: 'conversation', content: '2pcs ready stock', source: 'realtime',
+      chat_type: 'group', account_id: 'listener@s.whatsapp.net',
+      timestamp: '2026-08-25T02:23:00.000Z'
+    });
+    const stockDiscoveryMessages = database.getGroupMessagesEndingAt(group.id, stockId, 100).reverse();
+    const stockPreliminarySession = quotation.buildQuotationSession({
+      messages: stockDiscoveryMessages,
+      currentMessageId: stockId,
+      supplierSenderIds,
+      windowMinutes: 15,
+      maxMessages: 30
+    });
+    const stockDiscoverySession = quotation.buildQuotationSession({
+      messages: stockDiscoveryMessages,
+      currentMessageId: stockId,
+      supplierSenderIds,
+      windowMinutes: 60,
+      maxMessages: 100
+    });
+    const stockMessage = stockDiscoveryMessages.find(message => message.id === stockId);
+    const thirdResolution = cases.resolveQuotationCase({
+      message: { ...stockMessage, account_id: 'listener@s.whatsapp.net' },
+      group,
+      supplierSenderIds,
+      preliminarySession: stockPreliminarySession,
+      discoverySession: stockDiscoverySession,
+      settings
+    });
+
+    assert.equal(thirdResolution.outcome, 'matched');
+    assert.equal(thirdResolution.caseRecord.id, firstResolution.caseRecord.id);
+    assert.deepEqual(JSON.parse(thirdResolution.caseRecord.missing_fields_json), []);
 
     const persistentSession = cases.buildPersistentQuotationSession({
-      caseRecord: secondResolution.caseRecord,
-      currentMessageId: modelId,
+      caseRecord: thirdResolution.caseRecord,
+      currentMessageId: stockId,
       supplierSenderIds,
       settings
     });
     assert.equal(persistentSession.eligible, true);
-    assert.deepEqual(persistentSession.messages.map(message => message.id), [requestId, priceId, modelId]);
+    assert.deepEqual(persistentSession.messages.map(message => message.id), [requestId, priceId, modelId, stockId]);
   } finally {
     database.db.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
-

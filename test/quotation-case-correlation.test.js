@@ -18,7 +18,7 @@ const baseCase = {
     models: [],
     years: []
   }),
-  missing_fields_json: JSON.stringify(['model']),
+  missing_fields_json: JSON.stringify(['model', 'quantity', 'confirmed_availability']),
   source_message_ids: JSON.stringify(['request-1', 'supplier-1']),
   last_activity_at: '2026-08-25T02:00:00.000Z',
   expires_at: '2026-08-25T03:00:00.000Z'
@@ -43,7 +43,26 @@ test('retains known evidence and reports only required missing fields', () => {
   assert.deepEqual(signals.sizes, ['235/55/19']);
   assert.deepEqual(signals.brands, ['Michelin']);
   assert.deepEqual(signals.prices, [235]);
-  assert.deepEqual(missingQuotationFields(signals), ['model']);
+  assert.deepEqual(missingQuotationFields(signals), ['model', 'quantity', 'confirmed_availability']);
+});
+
+test('does not treat requester order quantity as supplier stock confirmation', () => {
+  const signals = signalsForMessages([
+    { role: 'requester', content: 'Need 4pcs 235/55R19 Michelin PS5' },
+    { role: 'supplier', content: 'Michelin PS5 $235, available now' }
+  ]);
+  assert.deepEqual(signals.quantities, []);
+  assert.deepEqual(signals.availabilities, ['ready_stock']);
+  assert.deepEqual(missingQuotationFields(signals), ['quantity']);
+});
+
+test('keeps preorder availability incomplete for the Oracle-ready gate', () => {
+  const signals = signalsForMessages([
+    { role: 'supplier', content: '235/55R19 Michelin PS5 $235, 2pcs preorder' }
+  ]);
+  assert.deepEqual(signals.quantities, [2]);
+  assert.deepEqual(signals.availabilities, ['preorder']);
+  assert.deepEqual(missingQuotationFields(signals), ['confirmed_availability']);
 });
 
 test('matches a late fragment that fills the only open case after the quiet period', () => {
@@ -60,7 +79,8 @@ test('treats a late price-only message as a correction only when one case is pla
   const completeCase = {
     ...baseCase,
     known_fields_json: JSON.stringify({
-      sizes: ['235/55/19'], prices: [235], brands: ['Michelin'], models: ['pilot sport 5'], years: [2026]
+      sizes: ['235/55/19'], prices: [235], brands: ['Michelin'], models: ['pilot sport 5'], years: [2026],
+      quantities: [2], availabilities: ['ready_stock']
     }),
     missing_fields_json: JSON.stringify([])
   };
