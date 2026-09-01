@@ -24,7 +24,7 @@ export default function LiveFeedTab({ liveMessages, logs, chats }) {
     setError('');
 
     try {
-      const params = new URLSearchParams({ limit: '200' });
+      const params = new URLSearchParams({ limit: '1000' });
       if (selectedChat) params.set('groupId', selectedChat);
       const response = await fetch(`/api/messages?${params.toString()}`);
       if (!response.ok) throw new Error(`Message history returned ${response.status}`);
@@ -64,7 +64,7 @@ export default function LiveFeedTab({ liveMessages, logs, chats }) {
 
     return Array.from(merged.values())
       .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-      .slice(0, 200);
+      .slice(0, 1000);
   }, [liveMessages, selectedChat, storedMessages]);
 
   const groupChats = chats.filter(chat => chat.chat_type === 'group');
@@ -117,7 +117,7 @@ export default function LiveFeedTab({ liveMessages, logs, chats }) {
           <span>{loading ? 'Loading message history…' : `Showing ${messages.length} recent message${messages.length === 1 ? '' : 's'}`}</span>
           {lastUpdated && (
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
-              <CheckCircle2 size={14} color="#25d366" /> History checked {lastUpdated.toLocaleTimeString()}
+              <CheckCircle2 size={14} color="#25d366" /> Dashboard refreshed {lastUpdated.toLocaleTimeString()}
             </span>
           )}
         </div>
