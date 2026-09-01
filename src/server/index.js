@@ -19,6 +19,8 @@ import {
   getStats,
   getSettings,
   updateSettings,
+  getOracleQuoteCaseById,
+  getOracleQuoteCases,
   getOracleQuoteRuns,
   getOracleSyncEvents,
   getActiveWhatsappAccount,
@@ -484,10 +486,15 @@ app.get('/api/oracle/runs', (req, res) => {
   res.json(getOracleQuoteRuns(req.query.limit));
 });
 
+app.get('/api/oracle/cases', (req, res) => {
+  res.json(getOracleQuoteCases(req.query.limit));
+});
+
 app.post('/api/oracle/syncs/:id/publish', async (req, res) => {
   try {
     const event = await publishOracleSyncEvent(Number(req.params.id));
     io.emit('oracle_sync_result', event);
+    if (event?.case_id) io.emit('oracle_case_result', getOracleQuoteCaseById(event.case_id));
     res.json({ message: 'Quotation published to Oracle.', event });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -544,6 +551,7 @@ io.on('connection', (socket) => {
   socket.emit('settings_updated', settingsForClient(getSettings()));
   socket.emit('stats_updated', getStats());
   socket.emit('oracle_syncs_updated', getOracleSyncEvents(100));
+  socket.emit('oracle_cases_updated', getOracleQuoteCases(100));
 });
 
 // Start Express server and launch WhatsApp client automatically

@@ -31,6 +31,7 @@ export default function App() {
   const [oracleStatus, setOracleStatus] = useState({ configured: false, connected: false, suppliers: [], error: null });
   const [oracleEvents, setOracleEvents] = useState([]);
   const [oracleRuns, setOracleRuns] = useState([]);
+  const [oracleCases, setOracleCases] = useState([]);
 
   useEffect(() => {
     socket.on('connection_status', (data) => {
@@ -64,7 +65,13 @@ export default function App() {
       setOracleRuns(previous => [item, ...previous.filter(run => run.id !== item.id)].slice(0, 100));
     });
 
+    socket.on('oracle_case_result', (item) => {
+      if (!item) return;
+      setOracleCases(previous => [item, ...previous.filter(caseItem => caseItem.id !== item.id)].slice(0, 100));
+    });
+
     socket.on('oracle_syncs_updated', (items) => setOracleEvents(items));
+    socket.on('oracle_cases_updated', (items) => setOracleCases(items));
 
     socket.on('log', (logObj) => {
       setLogs(prev => [...prev.slice(-199), logObj]);
@@ -84,14 +91,16 @@ export default function App() {
       socket.off('extraction_result');
       socket.off('oracle_sync_result');
       socket.off('oracle_run_result');
+      socket.off('oracle_case_result');
       socket.off('oracle_syncs_updated');
+      socket.off('oracle_cases_updated');
       socket.off('log');
     };
   }, []);
 
   const fetchInitialData = async () => {
     try {
-      const [resStatus, resGroups, resDms, resSchemas, resSettings, resStats, resOracleStatus, resOracleEvents, resOracleRuns] = await Promise.all([
+      const [resStatus, resGroups, resDms, resSchemas, resSettings, resStats, resOracleStatus, resOracleEvents, resOracleRuns, resOracleCases] = await Promise.all([
         fetch('/api/status').then(r => r.json()),
         fetch('/api/groups').then(r => r.json()),
         fetch('/api/dms').then(r => r.json()),
@@ -100,7 +109,8 @@ export default function App() {
         fetch('/api/stats').then(r => r.json()),
         fetch('/api/oracle/status').then(r => r.json()),
         fetch('/api/oracle/syncs?limit=100').then(r => r.json()),
-        fetch('/api/oracle/runs?limit=100').then(r => r.json())
+        fetch('/api/oracle/runs?limit=100').then(r => r.json()),
+        fetch('/api/oracle/cases?limit=100').then(r => r.json())
       ]);
       setConnState(resStatus);
       setGroups(resGroups);
@@ -111,6 +121,7 @@ export default function App() {
       setOracleStatus(resOracleStatus);
       setOracleEvents(resOracleEvents);
       setOracleRuns(resOracleRuns);
+      setOracleCases(resOracleCases);
     } catch (err) {
       console.error('Error fetching initial dashboard data:', err);
     }
@@ -310,6 +321,7 @@ export default function App() {
             oracleStatus={oracleStatus}
             oracleEvents={oracleEvents}
             oracleRuns={oracleRuns}
+            oracleCases={oracleCases}
             settings={settings}
             onConnect={handleConnect}
             onReplaceAccount={handleReplaceWhatsApp}

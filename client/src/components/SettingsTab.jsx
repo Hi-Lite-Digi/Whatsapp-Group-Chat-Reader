@@ -190,6 +190,37 @@ export default function SettingsTab({ settings, onSaveSettings }) {
             </select>
           </div>
 
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '14px' }}>
+            <div>
+              <label style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-main)', display: 'block', marginBottom: '8px' }}>
+                Supplier Quiet Period (seconds)
+              </label>
+              <input
+                type="number"
+                min="5"
+                max="300"
+                className="input-field"
+                value={formData.oracle_quiet_period_seconds || '45'}
+                onChange={(e) => setFormData({ ...formData, oracle_quiet_period_seconds: e.target.value })}
+              />
+              <p style={{ color: 'var(--text-dim)', fontSize: '0.75rem', marginTop: '6px', lineHeight: 1.4 }}>Evaluation starts after this much supplier silence. It does not close the case.</p>
+            </div>
+            <div>
+              <label style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-main)', display: 'block', marginBottom: '8px' }}>
+                Quotation Case Lifetime (minutes)
+              </label>
+              <input
+                type="number"
+                min="15"
+                max="1440"
+                className="input-field"
+                value={formData.oracle_case_lifetime_minutes || '60'}
+                onChange={(e) => setFormData({ ...formData, oracle_case_lifetime_minutes: e.target.value })}
+              />
+              <p style={{ color: 'var(--text-dim)', fontSize: '0.75rem', marginTop: '6px', lineHeight: 1.4 }}>Related late fragments may re-open evaluation while the case remains active.</p>
+            </div>
+          </div>
+
           <button type="submit" className="btn btn-primary" style={{ marginTop: '10px' }}>
             <Save size={18} /> Save Configurations
           </button>

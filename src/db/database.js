@@ -74,6 +74,7 @@ export function initDatabase() {
       source TEXT NOT NULL DEFAULT 'realtime',
       chat_type TEXT NOT NULL DEFAULT 'group',
       account_id TEXT,
+      reply_to_wa_message_id TEXT,
       timestamp TEXT NOT NULL
     );
 
@@ -117,6 +118,9 @@ export function initDatabase() {
       availability TEXT,
       match_type TEXT,
       source_message_ids TEXT,
+      case_id INTEGER,
+      supersedes_event_id INTEGER,
+      superseded_by_event_id INTEGER,
       oracle_price_id TEXT,
       request_payload TEXT NOT NULL,
       response_json TEXT,
@@ -135,10 +139,50 @@ export function initDatabase() {
       source_message_ids TEXT,
       extraction_json TEXT,
       event_count INTEGER DEFAULT 0,
+      case_id INTEGER,
       error_message TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (trigger_message_id) REFERENCES messages (id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS oracle_quote_cases (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT,
+      group_id TEXT NOT NULL,
+      supplier_code TEXT NOT NULL,
+      supplier_sender_id TEXT,
+      requester_sender_id TEXT,
+      request_message_id INTEGER,
+      status TEXT NOT NULL DEFAULT 'collecting',
+      known_fields_json TEXT NOT NULL DEFAULT '{}',
+      missing_fields_json TEXT NOT NULL DEFAULT '[]',
+      source_message_ids TEXT NOT NULL DEFAULT '[]',
+      correlation_json TEXT,
+      current_event_id INTEGER,
+      last_message_id INTEGER,
+      last_reason TEXT,
+      opened_at TEXT NOT NULL,
+      last_activity_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      completed_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (request_message_id) REFERENCES messages (id) ON DELETE SET NULL,
+      FOREIGN KEY (last_message_id) REFERENCES messages (id) ON DELETE SET NULL,
+      FOREIGN KEY (current_event_id) REFERENCES oracle_sync_events (id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS oracle_quote_case_messages (
+      case_id INTEGER NOT NULL,
+      message_id INTEGER NOT NULL,
+      role TEXT NOT NULL,
+      correlation_score REAL,
+      match_reasons_json TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (case_id, message_id),
+      FOREIGN KEY (case_id) REFERENCES oracle_quote_cases (id) ON DELETE CASCADE,
+      FOREIGN KEY (message_id) REFERENCES messages (id) ON DELETE CASCADE
     );
 
     CREATE INDEX IF NOT EXISTS idx_oracle_sync_events_created
@@ -147,6 +191,12 @@ export function initDatabase() {
       ON oracle_sync_events (group_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_oracle_quote_runs_group
       ON oracle_quote_runs (group_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_oracle_quote_cases_active
+      ON oracle_quote_cases (account_id, group_id, supplier_code, expires_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_oracle_quote_cases_status
+      ON oracle_quote_cases (status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_oracle_quote_case_messages_message
+      ON oracle_quote_case_messages (message_id, case_id);
   `);
 
   // Keep older local databases compatible with the source marker.
@@ -159,6 +209,9 @@ export function initDatabase() {
   }
   if (!messageColumns.some(column => column.name === 'account_id')) {
     db.exec('ALTER TABLE messages ADD COLUMN account_id TEXT');
+  }
+  if (!messageColumns.some(column => column.name === 'reply_to_wa_message_id')) {
+    db.exec('ALTER TABLE messages ADD COLUMN reply_to_wa_message_id TEXT');
   }
 
   const dmColumns = db.prepare('PRAGMA table_info(dm_chats)').all();
@@ -185,11 +238,19 @@ export function initDatabase() {
     ['stock_quantity', 'INTEGER'],
     ['availability', 'TEXT'],
     ['match_type', 'TEXT'],
-    ['source_message_ids', 'TEXT']
+    ['source_message_ids', 'TEXT'],
+    ['case_id', 'INTEGER'],
+    ['supersedes_event_id', 'INTEGER'],
+    ['superseded_by_event_id', 'INTEGER']
   ]) {
     if (!oracleEventColumns.some(column => column.name === name)) {
       db.exec(`ALTER TABLE oracle_sync_events ADD COLUMN ${name} ${type}`);
     }
+  }
+
+  const oracleRunColumns = db.prepare('PRAGMA table_info(oracle_quote_runs)').all();
+  if (!oracleRunColumns.some(column => column.name === 'case_id')) {
+    db.exec('ALTER TABLE oracle_quote_runs ADD COLUMN case_id INTEGER');
   }
 
   db.exec(`
@@ -283,7 +344,8 @@ function seedDefaultSettings() {
     oracle_auto_publish: 'false',
     oracle_context_messages: '30',
     oracle_context_minutes: '15',
-    oracle_quiet_period_seconds: '45'
+    oracle_quiet_period_seconds: '45',
+    oracle_case_lifetime_minutes: '60'
   };
 
   const check = db.prepare('SELECT key FROM settings WHERE key = ?');
@@ -511,8 +573,8 @@ export function deleteSchema(id) {
 // Message & Extraction helpers
 export function saveMessage(msg) {
   const stmt = db.prepare(`
-    INSERT OR IGNORE INTO messages (wa_message_id, group_id, group_name, sender_id, sender_name, message_type, content, extracted_text, media_path, media_mime, raw_json, source, chat_type, account_id, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO messages (wa_message_id, group_id, group_name, sender_id, sender_name, message_type, content, extracted_text, media_path, media_mime, raw_json, source, chat_type, account_id, reply_to_wa_message_id, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const result = stmt.run(
     msg.wa_message_id,
@@ -529,6 +591,7 @@ export function saveMessage(msg) {
     msg.source || 'realtime',
     msg.chat_type || 'group',
     msg.account_id || getActiveWhatsappAccount(),
+    msg.reply_to_wa_message_id || null,
     msg.timestamp
   );
   if (result.changes === 0) {
@@ -559,7 +622,8 @@ export function getRecentGroupMessages(groupId, limit = 12) {
   const safeLimit = Math.max(1, Math.min(Number(limit) || 12, 50));
   const activeAccount = getActiveWhatsappAccount();
   return db.prepare(`
-    SELECT id, wa_message_id, group_id, sender_id, sender_name, content, extracted_text, timestamp
+    SELECT id, wa_message_id, group_id, sender_id, sender_name, content, extracted_text,
+      reply_to_wa_message_id, timestamp
     FROM messages
     WHERE group_id = ? AND chat_type = 'group'
       AND (? IS NULL OR account_id = ?)
@@ -569,7 +633,7 @@ export function getRecentGroupMessages(groupId, limit = 12) {
 }
 
 export function getGroupMessagesEndingAt(groupId, currentMessageId, limit = 12) {
-  const safeLimit = Math.max(1, Math.min(Number(limit) || 12, 50));
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 12, 200));
   const activeAccount = getActiveWhatsappAccount();
   const current = db.prepare(`
     SELECT id, timestamp
@@ -580,7 +644,8 @@ export function getGroupMessagesEndingAt(groupId, currentMessageId, limit = 12) 
   if (!current) return [];
 
   return db.prepare(`
-    SELECT id, wa_message_id, group_id, sender_id, sender_name, content, extracted_text, timestamp
+    SELECT id, wa_message_id, group_id, sender_id, sender_name, content, extracted_text,
+      reply_to_wa_message_id, timestamp
     FROM messages
     WHERE group_id = ? AND chat_type = 'group'
       AND (? IS NULL OR account_id = ?)
@@ -598,6 +663,161 @@ export function getGroupMessagesEndingAt(groupId, currentMessageId, limit = 12) 
   );
 }
 
+function serializeJson(value, fallback) {
+  if (value == null) return JSON.stringify(fallback);
+  return typeof value === 'string' ? value : JSON.stringify(value);
+}
+
+export function createOracleQuoteCase(caseRecord) {
+  const result = db.prepare(`
+    INSERT INTO oracle_quote_cases (
+      account_id, group_id, supplier_code, supplier_sender_id,
+      requester_sender_id, request_message_id, status, known_fields_json,
+      missing_fields_json, source_message_ids, correlation_json,
+      current_event_id, last_message_id, last_reason, opened_at,
+      last_activity_at, expires_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    caseRecord.account_id || getActiveWhatsappAccount(),
+    caseRecord.group_id,
+    caseRecord.supplier_code,
+    caseRecord.supplier_sender_id || null,
+    caseRecord.requester_sender_id || null,
+    caseRecord.request_message_id || null,
+    caseRecord.status || 'collecting',
+    serializeJson(caseRecord.known_fields_json, {}),
+    serializeJson(caseRecord.missing_fields_json, []),
+    serializeJson(caseRecord.source_message_ids, []),
+    caseRecord.correlation_json == null ? null : serializeJson(caseRecord.correlation_json, {}),
+    caseRecord.current_event_id || null,
+    caseRecord.last_message_id || null,
+    caseRecord.last_reason || null,
+    caseRecord.opened_at,
+    caseRecord.last_activity_at,
+    caseRecord.expires_at,
+    caseRecord.completed_at || null
+  );
+  return getOracleQuoteCaseById(Number(result.lastInsertRowid));
+}
+
+export function getOracleQuoteCaseById(id) {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return null;
+  return db.prepare(`
+    SELECT c.*, g.name AS group_name,
+      (SELECT COUNT(*) FROM oracle_quote_case_messages cm WHERE cm.case_id = c.id) AS message_count
+    FROM oracle_quote_cases c
+    LEFT JOIN groups g ON g.id = c.group_id
+    WHERE c.id = ? AND c.account_id = ?
+  `).get(id, activeAccount);
+}
+
+export function updateOracleQuoteCase(id, changes) {
+  const allowed = [
+    'status',
+    'known_fields_json',
+    'missing_fields_json',
+    'source_message_ids',
+    'correlation_json',
+    'current_event_id',
+    'last_message_id',
+    'last_reason',
+    'last_activity_at',
+    'expires_at',
+    'completed_at',
+    'requester_sender_id',
+    'request_message_id'
+  ];
+  const jsonColumns = new Set(['known_fields_json', 'missing_fields_json', 'source_message_ids', 'correlation_json']);
+  const entries = Object.entries(changes).filter(([key]) => allowed.includes(key));
+  if (entries.length === 0) return getOracleQuoteCaseById(id);
+  const values = entries.map(([key, value]) => jsonColumns.has(key) && value != null ? serializeJson(value, null) : value);
+  const assignments = entries.map(([key]) => `${key} = ?`).join(', ');
+  db.prepare(`UPDATE oracle_quote_cases SET ${assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+    .run(...values.map(value => value ?? null), id);
+  return getOracleQuoteCaseById(id);
+}
+
+export function attachMessagesToOracleQuoteCase(caseId, messages, { roleForMessage, correlationScore = null, matchReasons = [] } = {}) {
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO oracle_quote_case_messages (
+      case_id, message_id, role, correlation_score, match_reasons_json
+    ) VALUES (?, ?, ?, ?, ?)
+  `);
+  const attach = db.transaction(rows => {
+    for (const message of rows || []) {
+      if (!message?.id) continue;
+      const role = roleForMessage ? roleForMessage(message) : 'context';
+      insert.run(caseId, message.id, role, correlationScore, serializeJson(matchReasons, []));
+    }
+  });
+  attach(messages);
+
+  const attached = getOracleQuoteCaseMessages(caseId);
+  const sourceIds = attached.map(message => message.wa_message_id || String(message.id));
+  if (sourceIds.length > 0) {
+    db.prepare('UPDATE oracle_quote_cases SET source_message_ids = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(JSON.stringify(sourceIds), caseId);
+  }
+  return getOracleQuoteCaseById(caseId);
+}
+
+export function getOracleQuoteCaseMessages(caseId) {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return [];
+  return db.prepare(`
+    SELECT m.id, m.wa_message_id, m.group_id, m.sender_id, m.sender_name,
+      m.content, m.extracted_text, m.reply_to_wa_message_id, m.timestamp,
+      cm.role, cm.correlation_score, cm.match_reasons_json
+    FROM oracle_quote_case_messages cm
+    INNER JOIN oracle_quote_cases c ON c.id = cm.case_id AND c.account_id = ?
+    INNER JOIN messages m ON m.id = cm.message_id AND m.account_id = c.account_id
+    WHERE cm.case_id = ?
+    ORDER BY m.timestamp ASC, m.id ASC
+  `).all(activeAccount, caseId);
+}
+
+export function expireOracleQuoteCases(atTimestamp = new Date().toISOString()) {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return 0;
+  return db.prepare(`
+    UPDATE oracle_quote_cases
+    SET status = 'expired', last_reason = 'case_lifetime_elapsed',
+      completed_at = COALESCE(completed_at, ?), updated_at = CURRENT_TIMESTAMP
+    WHERE account_id = ? AND expires_at < ?
+      AND status IN ('collecting', 'incomplete', 'ambiguous')
+  `).run(atTimestamp, activeAccount, atTimestamp).changes;
+}
+
+export function getActiveOracleQuoteCases(groupId, supplierCode, atTimestamp = new Date().toISOString()) {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return [];
+  return db.prepare(`
+    SELECT c.*, g.name AS group_name
+    FROM oracle_quote_cases c
+    LEFT JOIN groups g ON g.id = c.group_id
+    WHERE c.account_id = ? AND c.group_id = ? AND c.supplier_code = ?
+      AND c.expires_at >= ?
+      AND c.status IN ('collecting', 'incomplete', 'ready', 'published')
+    ORDER BY c.last_activity_at DESC, c.id DESC
+  `).all(activeAccount, groupId, supplierCode, atTimestamp);
+}
+
+export function getOracleQuoteCases(limit = 100) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return [];
+  return db.prepare(`
+    SELECT c.*, g.name AS group_name,
+      (SELECT COUNT(*) FROM oracle_quote_case_messages cm WHERE cm.case_id = c.id) AS message_count
+    FROM oracle_quote_cases c
+    LEFT JOIN groups g ON g.id = c.group_id
+    WHERE c.account_id = ?
+    ORDER BY c.updated_at DESC, c.id DESC
+    LIMIT ?
+  `).all(activeAccount, safeLimit);
+}
+
 export function createOracleSyncEvent(event) {
   const stmt = db.prepare(`
     INSERT OR IGNORE INTO oracle_sync_events (
@@ -605,8 +825,8 @@ export function createOracleSyncEvent(event) {
       listing_status, sync_status, brand, model, size, price,
       year_of_manufacture, country_of_origin, quoted_at, confidence,
       stock_quantity, availability, match_type, source_message_ids,
-      request_payload
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      case_id, supersedes_event_id, request_payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const result = stmt.run(
     event.message_id,
@@ -628,6 +848,8 @@ export function createOracleSyncEvent(event) {
     event.availability || null,
     event.match_type || null,
     event.source_message_ids ? JSON.stringify(event.source_message_ids) : null,
+    event.case_id || null,
+    event.supersedes_event_id || null,
     event.request_payload
   );
   if (result.changes === 0) return null;
@@ -638,8 +860,8 @@ export function createOracleQuoteRun(run) {
   const result = db.prepare(`
     INSERT INTO oracle_quote_runs (
       group_id, trigger_message_id, status, reason, source_message_ids,
-      extraction_json, event_count, error_message
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      extraction_json, event_count, case_id, error_message
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     run.group_id,
     run.trigger_message_id,
@@ -648,6 +870,7 @@ export function createOracleQuoteRun(run) {
     run.source_message_ids ? JSON.stringify(run.source_message_ids) : null,
     run.extraction_json ? JSON.stringify(run.extraction_json) : null,
     Number(run.event_count) || 0,
+    run.case_id || null,
     run.error_message || null
   );
   return getOracleQuoteRunById(Number(result.lastInsertRowid));
@@ -705,12 +928,38 @@ export function getOracleSyncEventById(id) {
   `).get(activeAccount, id);
 }
 
+export function getOracleSyncEventByPayloadHash(payloadHash) {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return null;
+  return db.prepare(`
+    SELECT e.*, g.name AS group_name
+    FROM oracle_sync_events e
+    LEFT JOIN groups g ON g.id = e.group_id
+    INNER JOIN messages m ON m.id = e.message_id AND m.account_id = ?
+    WHERE e.payload_hash = ?
+  `).get(activeAccount, payloadHash);
+}
+
+export function getOracleSyncEventsForCase(caseId) {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount || !caseId) return [];
+  return db.prepare(`
+    SELECT e.*, g.name AS group_name
+    FROM oracle_sync_events e
+    LEFT JOIN groups g ON g.id = e.group_id
+    INNER JOIN messages m ON m.id = e.message_id AND m.account_id = ?
+    WHERE e.case_id = ?
+    ORDER BY e.created_at DESC, e.id DESC
+  `).all(activeAccount, caseId);
+}
+
 export function updateOracleSyncEvent(id, changes) {
   const allowed = [
     'sync_status',
     'oracle_price_id',
     'response_json',
-    'error_message'
+    'error_message',
+    'superseded_by_event_id'
   ];
   const entries = Object.entries(changes).filter(([key]) => allowed.includes(key));
   if (entries.length === 0) return getOracleSyncEventById(id);

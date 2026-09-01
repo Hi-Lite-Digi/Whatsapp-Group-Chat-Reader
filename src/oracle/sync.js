@@ -4,7 +4,9 @@ import {
   createOracleQuoteRun,
   createOracleSyncEvent,
   getGroupMessagesEndingAt,
+  getOracleSyncEventByPayloadHash,
   getOracleSyncEventById,
+  getOracleSyncEventsForCase,
   getSettings,
   updateOracleQuoteRun,
   updateOracleSyncEvent
@@ -25,6 +27,15 @@ import {
   quotationItemHasEvidence,
   sourceMessageIds
 } from './quotation.js';
+import {
+  buildPersistentQuotationSession,
+  markQuotationCaseDuplicate,
+  markQuotationCaseIncomplete,
+  markQuotationCasePublished,
+  markQuotationCaseReady,
+  quotationCaseLifetimeMinutes,
+  resolveQuotationCase
+} from './cases.js';
 
 export { normalizeTyreSize } from './quotation.js';
 
@@ -157,6 +168,16 @@ function payloadHash(supplierCode, item) {
   return crypto.createHash('sha256').update(stable).digest('hex');
 }
 
+export function findSupersededCaseEvent(priorCaseEvents, item, nextPayloadHash) {
+  return (priorCaseEvents || []).find(candidate =>
+    candidate.payload_hash !== nextPayloadHash
+    && candidate.sync_status !== 'superseded'
+    && normalizeText(candidate.brand) === normalizeText(item.brand)
+    && normalizeText(canonicalModel(candidate.model)) === normalizeText(canonicalModel(item.model))
+    && normalizeTyreSize(candidate.size) === item.size
+  ) || null;
+}
+
 function exactListing(rows, item) {
   const brand = normalizeText(item.brand);
   const model = normalizeText(canonicalModel(item.model));
@@ -234,7 +255,9 @@ async function publishEvent(event) {
     response_json: JSON.stringify({ publish: response, verified: verifiedRecord }),
     error_message: null
   });
-  return getOracleSyncEventById(event.id);
+  const publishedEvent = getOracleSyncEventById(event.id);
+  if (publishedEvent?.case_id) markQuotationCasePublished(publishedEvent.case_id, publishedEvent.id);
+  return publishedEvent;
 }
 
 export async function publishOracleSyncEvent(id) {
@@ -252,7 +275,7 @@ export async function publishOracleSyncEvent(id) {
   }
 }
 
-export async function processOracleGroupMessage({ message, group }) {
+export async function processOracleGroupMessage({ message, group, allowAutoPublish = true }) {
   if (group.oracle_sync_enabled !== 1 || !group.oracle_supplier_code) return null;
   const supplierSenderIds = supplierSenderIdsForGroup(group);
   if (supplierSenderIds.size === 0) {
@@ -265,24 +288,64 @@ export async function processOracleGroupMessage({ message, group }) {
   const settings = getSettings();
   const contextLimit = Math.max(3, Math.min(Number(settings.oracle_context_messages) || 30, 50));
   const contextMinutes = Math.max(1, Math.min(Number(settings.oracle_context_minutes) || 15, 1440));
-  const messages = getGroupMessagesEndingAt(group.id, message.id, contextLimit).reverse();
-  const session = buildQuotationSession({
-    messages,
+  const caseLifetimeMinutes = quotationCaseLifetimeMinutes(settings);
+  const discoveryLimit = Math.max(contextLimit, 100);
+  const discoveryMessages = getGroupMessagesEndingAt(group.id, message.id, discoveryLimit).reverse();
+  const contextMessages = discoveryMessages.slice(-contextLimit);
+  const preliminarySession = buildQuotationSession({
+    messages: contextMessages,
     currentMessageId: message.id,
     supplierSenderIds,
     windowMinutes: contextMinutes,
     maxMessages: contextLimit
   });
+  const discoverySession = buildQuotationSession({
+    messages: discoveryMessages,
+    currentMessageId: message.id,
+    supplierSenderIds,
+    windowMinutes: caseLifetimeMinutes,
+    maxMessages: discoveryLimit
+  });
+  const caseResolution = resolveQuotationCase({
+    message,
+    group,
+    supplierSenderIds,
+    preliminarySession,
+    discoverySession,
+    settings
+  });
+  let caseRecord = caseResolution.caseRecord;
+  if (caseResolution.outcome === 'ambiguous') {
+    const ambiguousSession = discoverySession?.messages?.length ? discoverySession : preliminarySession;
+    const run = createOracleQuoteRun({
+      group_id: group.id,
+      trigger_message_id: message.id,
+      status: 'skipped',
+      reason: 'ambiguous_case_match',
+      source_message_ids: sourceMessageIds(ambiguousSession),
+      case_id: caseRecord?.id || null
+    });
+    return { events: [], skipped: 'ambiguous_case_match', run, case: caseRecord };
+  }
+
+  const session = buildPersistentQuotationSession({
+    caseRecord,
+    currentMessageId: message.id,
+    supplierSenderIds,
+    settings
+  }) || preliminarySession;
   const messageIds = sourceMessageIds(session);
   const run = createOracleQuoteRun({
     group_id: group.id,
     trigger_message_id: message.id,
     status: session.eligible ? 'processing' : 'skipped',
     reason: session.reason,
-    source_message_ids: messageIds
+    source_message_ids: messageIds,
+    case_id: caseRecord?.id || null
   });
   if (!session.eligible) {
-    return { events: [], skipped: session.reason, run };
+    caseRecord = markQuotationCaseIncomplete(caseRecord?.id, session.reason, session) || caseRecord;
+    return { events: [], skipped: session.reason, run, case: caseRecord };
   }
 
   try {
@@ -305,7 +368,8 @@ export async function processOracleGroupMessage({ message, group }) {
       extraction_json: extraction,
       error_message: error
     });
-    return { extraction, events: [], error, run: updatedRun };
+    caseRecord = markQuotationCaseIncomplete(caseRecord?.id, 'llm_failure', session) || caseRecord;
+    return { extraction, events: [], error, run: updatedRun, case: caseRecord };
     }
     if (extraction.extractedData?.current_message_completes_quotation !== true) {
     const updatedRun = updateOracleQuoteRun(run.id, {
@@ -313,7 +377,8 @@ export async function processOracleGroupMessage({ message, group }) {
       reason: 'incomplete_or_irrelevant',
       extraction_json: extraction.extractedData
     });
-    return { extraction, events: [], skipped: 'incomplete_or_irrelevant', run: updatedRun };
+    caseRecord = markQuotationCaseIncomplete(caseRecord?.id, 'incomplete_or_irrelevant', session) || caseRecord;
+    return { extraction, events: [], skipped: 'incomplete_or_irrelevant', run: updatedRun, case: caseRecord };
     }
 
     const supplierCode = String(group.oracle_supplier_code).trim().toUpperCase();
@@ -327,7 +392,8 @@ export async function processOracleGroupMessage({ message, group }) {
       extraction_json: extraction.extractedData,
       error_message: error
     });
-    return { extraction, events: [], error, run: updatedRun };
+    caseRecord = markQuotationCaseIncomplete(caseRecord?.id, 'invalid_supplier_mapping', session) || caseRecord;
+    return { extraction, events: [], error, run: updatedRun, case: caseRecord };
     }
 
     const rawItems = Array.isArray(extraction.extractedData?.items) ? extraction.extractedData.items : [];
@@ -349,24 +415,31 @@ export async function processOracleGroupMessage({ message, group }) {
       reason: rawItems.length > 0 ? 'failed_evidence_validation' : 'no_quote_items',
       extraction_json: extraction.extractedData
     });
+    const incompleteReason = rawItems.length > 0 ? 'failed_evidence_validation' : 'no_quote_items';
+    caseRecord = markQuotationCaseIncomplete(caseRecord?.id, incompleteReason, session) || caseRecord;
     return {
       extraction,
       events: [],
-      skipped: rawItems.length > 0 ? 'failed_evidence_validation' : 'no_quote_items',
-      run: updatedRun
+      skipped: incompleteReason,
+      run: updatedRun,
+      case: caseRecord
     };
     }
     const events = [];
+    const duplicateEvents = [];
+    const priorCaseEvents = caseRecord?.id ? getOracleSyncEventsForCase(caseRecord.id) : [];
 
     for (const item of items) {
     const { listingStatus } = await classifyListing(item);
     const payload = oraclePayload(item);
+    const hash = payloadHash(supplierCode, item);
+    const priorEvent = findSupersededCaseEvent(priorCaseEvents, item, hash);
     const event = createOracleSyncEvent({
       message_id: message.id,
       group_id: group.id,
       supplier_code: supplierCode,
       supplier_name: supplier.name,
-      payload_hash: payloadHash(supplierCode, item),
+      payload_hash: hash,
       listing_status: listingStatus,
       sync_status: 'ready',
       brand: item.brand,
@@ -381,11 +454,24 @@ export async function processOracleGroupMessage({ message, group }) {
       availability: item.availability,
       match_type: item.match_type,
       source_message_ids: messageIds,
+      case_id: caseRecord?.id || null,
+      supersedes_event_id: priorEvent?.id || null,
       request_payload: JSON.stringify(payload)
     });
 
-    if (!event) continue;
-    if (settings.oracle_auto_publish === 'true') {
+    if (!event) {
+      const duplicateEvent = getOracleSyncEventByPayloadHash(hash);
+      if (duplicateEvent) duplicateEvents.push(duplicateEvent);
+      continue;
+    }
+    if (priorEvent && ['ready', 'failed'].includes(priorEvent.sync_status)) {
+      updateOracleSyncEvent(priorEvent.id, {
+        sync_status: 'superseded',
+        superseded_by_event_id: event.id,
+        error_message: null
+      });
+    }
+    if (settings.oracle_auto_publish === 'true' && allowAutoPublish) {
       try {
         events.push(await publishEvent(event));
       } catch (error) {
@@ -404,13 +490,20 @@ export async function processOracleGroupMessage({ message, group }) {
       extraction_json: extraction.extractedData,
       event_count: events.length
     });
-    return { extraction, events, supplier, run: updatedRun };
+    const representativeEvent = events[0]
+      || duplicateEvents.find(event => event.case_id === caseRecord?.id)
+      || null;
+    caseRecord = representativeEvent
+      ? markQuotationCaseReady(caseRecord?.id, representativeEvent, items, messageIds) || caseRecord
+      : markQuotationCaseDuplicate(caseRecord?.id, items, messageIds) || caseRecord;
+    return { extraction, events, supplier, run: updatedRun, case: caseRecord };
   } catch (error) {
     const updatedRun = updateOracleQuoteRun(run.id, {
       status: 'failed',
       reason: 'pipeline_error',
       error_message: error.message
     });
-    return { events: [], error: error.message, run: updatedRun };
+    caseRecord = markQuotationCaseIncomplete(caseRecord?.id, 'pipeline_error', session) || caseRecord;
+    return { events: [], error: error.message, run: updatedRun, case: caseRecord };
   }
 }

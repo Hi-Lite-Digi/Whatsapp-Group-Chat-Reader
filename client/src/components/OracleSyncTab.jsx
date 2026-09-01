@@ -15,8 +15,24 @@ import {
 function statusBadge(status) {
   if (status === 'published') return 'badge badge-success';
   if (status === 'ready') return 'badge badge-warning';
-  if (status === 'failed') return 'badge badge-danger';
+  if (status === 'failed' || status === 'ambiguous') return 'badge badge-danger';
   return 'badge badge-info';
+}
+
+function parsedJson(value, fallback) {
+  if (!value) return fallback;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function knownCaseSummary(caseItem) {
+  const fields = parsedJson(caseItem.known_fields_json, {});
+  return [
+    ...(fields.sizes || []),
+    ...(fields.brands || []),
+    ...(fields.models || []),
+    ...(fields.prices || []).map(price => `S$${Number(price).toFixed(2)}`)
+  ].join(' · ') || 'Evidence collecting';
 }
 
 function listingLabel(status) {
@@ -33,6 +49,7 @@ export default function OracleSyncTab({
   oracleStatus,
   oracleEvents,
   oracleRuns,
+  oracleCases = [],
   settings,
   onConnect,
   onReplaceAccount,
@@ -158,6 +175,45 @@ export default function OracleSyncTab({
       <section className="glass-panel" style={{ overflow: 'hidden' }}>
         <div style={{ padding: '20px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' }}>
           <div>
+            <h3 style={{ fontSize: '1rem' }}>Quotation Case Register</h3>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '4px' }}>Cases remain available beyond the 45-second quiet period so later fragments can fill missing evidence safely.</p>
+          </div>
+          <span className="badge badge-info">{oracleCases.length} cases</span>
+        </div>
+        {oracleCases.length === 0 ? (
+          <div style={{ padding: '28px 20px', textAlign: 'center', color: 'var(--text-muted)' }}>No persistent quotation cases have been opened yet.</div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '980px' }}>
+              <thead>
+                <tr style={{ color: 'var(--text-dim)', fontSize: '0.72rem', textTransform: 'uppercase', textAlign: 'left' }}>
+                  {['Updated', 'Case', 'Supplier / Group', 'Known Evidence', 'Missing', 'Messages', 'Status'].map(label => <th key={label} style={{ padding: '13px 16px', borderBottom: '1px solid var(--border-color)' }}>{label}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {oracleCases.slice(0, 50).map(caseItem => {
+                  const missing = parsedJson(caseItem.missing_fields_json, []);
+                  return (
+                    <tr key={caseItem.id} style={{ borderBottom: '1px solid var(--border-color)', verticalAlign: 'top' }}>
+                      <td style={{ padding: '13px 16px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{new Date(`${caseItem.updated_at}Z`).toLocaleString()}</td>
+                      <td style={{ padding: '13px 16px', fontWeight: 700 }}>Q-{String(caseItem.id).padStart(4, '0')}</td>
+                      <td style={{ padding: '13px 16px' }}><strong>{caseItem.supplier_code}</strong><div style={{ color: 'var(--text-dim)', fontSize: '0.78rem', marginTop: '4px' }}>{caseItem.group_name || caseItem.group_id}</div></td>
+                      <td style={{ padding: '13px 16px', color: 'var(--text-muted)', maxWidth: '340px' }}>{knownCaseSummary(caseItem)}</td>
+                      <td style={{ padding: '13px 16px', color: missing.length ? '#fbbf24' : '#4ade80' }}>{missing.length ? missing.join(', ') : 'Complete'}</td>
+                      <td style={{ padding: '13px 16px' }}>{caseItem.message_count || 0}</td>
+                      <td style={{ padding: '13px 16px' }}><span className={statusBadge(caseItem.status)}>{caseItem.status}</span>{caseItem.last_reason && <div style={{ color: 'var(--text-dim)', fontSize: '0.72rem', marginTop: '5px' }}>{caseItem.last_reason}</div>}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section className="glass-panel" style={{ overflow: 'hidden' }}>
+        <div style={{ padding: '20px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' }}>
+          <div>
             <h3 style={{ fontSize: '1rem' }}>Quotation Review Queue</h3>
             <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '4px' }}>Deduplicated supplier prices captured from mapped groups.</p>
           </div>
@@ -179,7 +235,7 @@ export default function OracleSyncTab({
                 {oracleEvents.map(event => (
                   <tr key={event.id} style={{ borderBottom: '1px solid var(--border-color)', verticalAlign: 'top' }}>
                     <td style={{ padding: '15px 16px', color: 'var(--text-muted)', fontSize: '0.8rem', whiteSpace: 'nowrap' }}>{new Date(`${event.created_at}Z`).toLocaleString()}</td>
-                    <td style={{ padding: '15px 16px' }}><strong>{event.supplier_name || event.supplier_code}</strong><div style={{ color: 'var(--text-dim)', fontSize: '0.78rem', marginTop: '4px' }}>{event.group_name}</div></td>
+                    <td style={{ padding: '15px 16px' }}><strong>{event.supplier_name || event.supplier_code}</strong><div style={{ color: 'var(--text-dim)', fontSize: '0.78rem', marginTop: '4px' }}>{event.group_name}{event.case_id ? ` · Q-${String(event.case_id).padStart(4, '0')}` : ''}</div></td>
                     <td style={{ padding: '15px 16px' }}><strong>{event.brand} {event.model}</strong><div style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '4px' }}>{event.size}{event.year_of_manufacture ? ` · ${event.year_of_manufacture}` : ''}</div></td>
                     <td style={{ padding: '15px 16px', fontWeight: 700, whiteSpace: 'nowrap' }}>S${Number(event.price).toFixed(2)}</td>
                     <td style={{ padding: '15px 16px', color: 'var(--text-muted)', fontSize: '0.8rem' }}>{listingLabel(event.listing_status)}</td>
@@ -214,7 +270,7 @@ export default function OracleSyncTab({
             <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '760px' }}>
               <thead>
                 <tr style={{ color: 'var(--text-dim)', fontSize: '0.72rem', textTransform: 'uppercase', textAlign: 'left' }}>
-                  {['Checked', 'Group', 'Result', 'Reason', 'Source Messages', 'Quotes'].map(label => <th key={label} style={{ padding: '13px 16px', borderBottom: '1px solid var(--border-color)' }}>{label}</th>)}
+                  {['Checked', 'Group', 'Case', 'Result', 'Reason', 'Source Messages', 'Quotes'].map(label => <th key={label} style={{ padding: '13px 16px', borderBottom: '1px solid var(--border-color)' }}>{label}</th>)}
                 </tr>
               </thead>
               <tbody>
@@ -225,6 +281,7 @@ export default function OracleSyncTab({
                     <tr key={runItem.id} style={{ borderBottom: '1px solid var(--border-color)' }}>
                       <td style={{ padding: '13px 16px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{new Date(`${runItem.created_at}Z`).toLocaleString()}</td>
                       <td style={{ padding: '13px 16px' }}>{runItem.group_name || runItem.group_id}</td>
+                      <td style={{ padding: '13px 16px', fontWeight: 700 }}>{runItem.case_id ? `Q-${String(runItem.case_id).padStart(4, '0')}` : '—'}</td>
                       <td style={{ padding: '13px 16px' }}><span className={runItem.status === 'completed' ? 'badge badge-success' : runItem.status === 'failed' ? 'badge badge-danger' : 'badge badge-info'}>{runItem.status}</span></td>
                       <td style={{ padding: '13px 16px', color: 'var(--text-muted)' }}>{runItem.reason || 'Quotation captured'}</td>
                       <td style={{ padding: '13px 16px' }}>{sourceCount}</td>

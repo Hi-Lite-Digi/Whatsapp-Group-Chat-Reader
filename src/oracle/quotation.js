@@ -114,6 +114,62 @@ export function hasSupplierPrice(value) {
   return /(?:S\s*\$|SGD|\$)\s*\d+(?:\.\d{1,2})?/i.test(String(value || ''));
 }
 
+export function extractSupplierPrices(value) {
+  const prices = [];
+  for (const match of String(value || '').matchAll(/(?:S\s*\$|SGD|\$)\s*(\d+(?:\.\d{1,2})?)/gi)) {
+    const price = Number(match[1]);
+    if (Number.isFinite(price) && price > 0 && !prices.includes(price)) prices.push(price);
+  }
+  return prices;
+}
+
+function normalizedPhrasePresent(value, phrase) {
+  const source = normalizeComparable(value);
+  const candidate = normalizeComparable(phrase);
+  if (!candidate) return false;
+  const escaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s*');
+  return new RegExp(`(?:^|\\s)${escaped}(?:$|\\s)`, 'i').test(source);
+}
+
+export function extractKnownBrands(value) {
+  const brands = [];
+  for (const [alias, brand] of BRAND_ALIASES) {
+    if (normalizedPhrasePresent(value, alias) && !brands.includes(brand)) brands.push(brand);
+  }
+  return brands;
+}
+
+export function extractKnownModels(value) {
+  const models = [];
+  for (const [model, aliases] of MODEL_ALIASES) {
+    if ([model, ...aliases].some(alias => normalizedPhrasePresent(value, alias))) models.push(model);
+  }
+  return models;
+}
+
+export function extractQuotationSignals(value) {
+  const text = String(value || '');
+  const models = extractKnownModels(text);
+  const brands = extractKnownBrands(text);
+  for (const model of models) {
+    const inferredBrand = MODEL_BRANDS.get(model);
+    if (inferredBrand && !brands.includes(inferredBrand)) brands.push(inferredBrand);
+  }
+  const years = [...text.matchAll(/\b(?:20(\d{2})|(?:y|dot)\s*(\d{2}))\b/gi)]
+    .map(match => Number(match[1] || match[2]) + 2000)
+    .filter(year => year >= 2000 && year <= new Date().getFullYear() + 1)
+    .filter((year, index, all) => all.indexOf(year) === index);
+  return {
+    sizes: extractTyreSizes(text),
+    prices: extractSupplierPrices(text),
+    brands,
+    models,
+    years,
+    looksLikeRequest: looksLikeTyreRequest(text),
+    meaningfulContinuation: isMeaningfulContinuation(text)
+  };
+}
+
 export function looksLikeTyreRequest(value) {
   const text = String(value || '');
   if (BATTERY_PATTERN.test(text)) return false;
@@ -134,7 +190,7 @@ function isLogisticsOnly(value) {
     && (LOGISTICS_PATTERN.test(text) || ACK_PATTERN.test(text) || NON_TEXT_ACK_PATTERN.test(text));
 }
 
-function isMeaningfulContinuation(value) {
+export function isMeaningfulContinuation(value) {
   return CONTINUATION_PATTERN.test(String(value || ''));
 }
 

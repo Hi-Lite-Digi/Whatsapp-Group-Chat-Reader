@@ -41,24 +41,26 @@ The first Tyres Online records are two image listings at 13:53, followed by the 
 
 1. Store every monitored message with its native WhatsApp ID, sender identity, timestamp, source, and group.
 2. Ignore quotation triggering when the sender is not one of the supplier identities configured for that group.
-3. When a supplier replies, wait for a configurable quiet period. A new supplier fragment resets the timer.
-4. Build a bounded session ending at the supplier trigger message. Stop at the nearest relevant requester enquiry and enforce the configured time/message limits.
-5. For supplier images, transcribe only visible text and retain it with the message before quotation extraction.
-6. Extract only a complete new-tyre quotation that the latest supplier message completes or corrects.
-7. Require source evidence for tyre size, supplier price, brand, and model. Reject any generated value that cannot be traced to the bounded session.
-8. Reject negative availability, incomplete requests, requester messages, batteries, rims, services, and delivery-only discussion.
-9. Normalize size, per-piece price, year, country, quantity, availability, and exact/alternative/broadcast match type.
-10. Search Oracle by size, then match normalized brand/model aliases such as `PS5` and descriptive suffixes such as `XL` locally.
-11. Place the structured event in the review queue. Automatic publishing remains disabled unless explicitly enabled.
-12. Record every settled processing decision in the audit view, including skipped and failed checks with source message IDs.
-13. When publishing is enabled or staff approves an event, write it through Oracle's supplier-price endpoint and verify that the returned record appears in API history.
+3. When a supplier replies, wait for a configurable quiet period. A new supplier fragment resets the timer; the timer controls evaluation cadence, not case lifetime.
+4. Open or correlate a persistent quotation case. Prefer an explicit WhatsApp reply target, then the same requester anchor, matching size/brand/model evidence, missing-field completion, and recency.
+5. Keep incomplete cases active for a configurable lifetime (60 minutes by default), retaining known evidence, missing fields, source messages, and the correlation audit. If two cases are plausible, create an ambiguous review case and do not extract or publish.
+6. Build the extraction session from the messages attached to the matched case, including relevant evidence older than the short quiet-period context.
+7. For supplier images, transcribe only visible text and retain it with the message before quotation extraction.
+8. Extract only a complete new-tyre quotation that the latest supplier message completes or corrects.
+9. Require source evidence for tyre size, supplier price, brand, and model. Reject any generated value that cannot be traced to the case.
+10. Reject negative availability, incomplete requests, requester messages, batteries, rims, services, and delivery-only discussion.
+11. Normalize size, per-piece price, year, country, quantity, availability, and exact/alternative/broadcast match type.
+12. Search Oracle by size, then match normalized brand/model aliases such as `PS5` and descriptive suffixes such as `XL` locally.
+13. Place the structured event in the review queue. A correction supersedes an unpublished event for the same case and product. When several fragments settle together, apply the full batch before considering automatic publishing. Automatic publishing remains disabled unless explicitly enabled.
+14. Record every settled processing decision in the audit view, including skipped and failed checks with source message IDs and case ID.
+15. When publishing is enabled or staff approves an event, write it through Oracle's supplier-price endpoint and verify that the returned record appears in API history.
 
 ## Safety rules
 
 - Group-to-supplier mapping and sender allowlists are separate. A group supplier code alone is not enough to authorize a message as a supplier quotation.
 - Imported history is stored for context and analysis but is not replayed into Oracle automatically.
-- A quiet period prevents partial records from fragmented replies and allows corrections to settle.
-- A short context window prevents an old quotation from being joined to a later unrelated enquiry.
+- A quiet period prevents premature evaluation while fragments are arriving; it does not discard an incomplete case.
+- A finite case lifetime prevents old evidence from remaining eligible indefinitely. Conflicting request anchors and product evidence force a new or ambiguous case rather than an unsafe merge.
 - Brand, model, size, and price must all pass deterministic source-evidence checks after model extraction.
 - Generic per-message extraction is disabled for mapped quotation groups; only the settled, conversation-aware pipeline processes them.
 - Oracle read requests retry temporary rate limits and service failures. Price writes are never blindly retried because a timed-out write may already have succeeded.

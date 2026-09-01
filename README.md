@@ -77,10 +77,12 @@ This local application links one WhatsApp account, listens only to explicitly se
 1. Link the dedicated listener WhatsApp account from the **Quotation Sync** tab. The account must already be a member of the intended supplier groups.
 2. Open **Monitored Groups**, sync the group list, and select the matching Oracle supplier for each target group.
 3. Enable quotation sync only for verified supplier groups. All other chats remain unread and unstored.
-4. A complete supplier quote is normalized to brand, model, tyre size, per-piece price, year, origin, stated quantity/availability, match type, and quote date.
-5. The app checks whether the product is an existing Oracle listing with stock, an existing listing without stock, or a new listing.
-6. By default, the result waits in **Quotation Review Queue**. Press **Publish** only after checking the supplier, tyre, price, and GST convention.
-7. Automatic publishing is a separate setting and should stay off until the real Mrrjestic account and every supplier mapping have been validated.
+4. The first relevant exchange opens a persistent quotation case. The 45-second quiet period controls when the case is evaluated; it does not close the case.
+5. Related late fragments can fill missing brand, model, size, or price evidence during the configurable case lifetime (60 minutes by default). Direct WhatsApp replies and the original requester anchor outrank semantic matching; ambiguous matches stop for review.
+6. A complete supplier quote is normalized to brand, model, tyre size, per-piece price, year, origin, stated quantity/availability, match type, and quote date.
+7. The app checks whether the product is an existing Oracle listing with stock, an existing listing without stock, or a new listing.
+8. By default, the result waits in **Quotation Review Queue**. Press **Publish** only after checking the supplier, tyre, price, and GST convention.
+9. Automatic publishing is a separate setting and should stay off until the real Mrrjestic account and every supplier mapping have been validated.
 
 The current linked account is only a test session. Replacing it removes the local WhatsApp session and requires a fresh QR or pairing code, but it does not erase the database or group mappings.
 
@@ -103,6 +105,10 @@ ORACLE_API_TOKEN=replace_with_api_token
 - Duplicate quotations are blocked using a stable supplier/product/price/date fingerprint.
 - Incomplete or low-confidence quotations are rejected, and extracted brand/model/size/price values must be traceable to source messages.
 - Fragmented supplier replies are grouped into a bounded quotation session; mapped groups do not use the generic one-message extractor.
+- Incomplete cases persist with their known evidence and explicit missing fields. A later fragment can re-open evaluation even after the quiet-period check has run.
+- Case correlation prioritizes a WhatsApp reply target, the same requester anchor, matching tyre evidence, and recency. Two plausible matches are marked ambiguous rather than guessed.
+- Corrected candidates supersede unpublished review records for the same case and product. Published prices remain auditable and a correction becomes a newer price record.
+- When several supplier fragments settle together, the listener applies the complete batch before automatic publishing. Only candidates still marked ready after corrections and incomplete follow-ups are considered.
 - Realtime supplier images are transcribed before the same quotation evidence checks are applied.
 - The Processing Audit records completed, skipped, and failed checks with source-message counts and reasons.
 - A publish is marked successful only after its returned record ID appears in Oracle API history.

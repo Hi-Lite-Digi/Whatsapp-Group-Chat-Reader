@@ -24,6 +24,7 @@ import {
   saveExtraction,
   setActiveWhatsappAccount,
   getSettings,
+  getOracleQuoteCaseById,
   db
 } from '../db/database.js';
 import { processMediaMessage } from '../media/processor.js';
@@ -31,6 +32,7 @@ import { processMessageWithLLM } from '../llm/service.js';
 import {
   extractQuotationImageText,
   isConfiguredSupplierMessage,
+  publishOracleSyncEvent,
   processOracleGroupMessage
 } from '../oracle/sync.js';
 import { getDisconnectPolicy } from './disconnect-policy.js';
@@ -77,6 +79,7 @@ const requestedGroupHistory = new Map();
 const groupHistoryPageCounts = new Map();
 const exhaustedGroupHistory = new Set();
 const oracleSyncTimers = new Map();
+const oracleSyncPendingMessages = new Map();
 const MAX_HISTORY_PER_GROUP = Math.max(1, Number.parseInt(process.env.HISTORY_BUFFER_PER_GROUP || '500', 10));
 const MAX_HISTORY_TOTAL = Math.max(MAX_HISTORY_PER_GROUP, Number.parseInt(process.env.HISTORY_BUFFER_TOTAL || '5000', 10));
 const MAX_DM_HISTORY_PER_CHAT = Math.max(1, Number.parseInt(process.env.DM_HISTORY_BUFFER_PER_CHAT || '500', 10));
@@ -175,6 +178,9 @@ function scheduleInitialGroupSync() {
 }
 
 function emitOracleResult(oracleResult) {
+  if (oracleResult?.case && ioInstance) {
+    ioInstance.emit('oracle_case_result', oracleResult.case);
+  }
   if (oracleResult?.run && ioInstance) {
     ioInstance.emit('oracle_run_result', oracleResult.run);
   }
@@ -191,6 +197,10 @@ function emitOracleResult(oracleResult) {
 function scheduleOracleQuotationCheck(message, group) {
   if (!isConfiguredSupplierMessage(message, group)) return false;
 
+  const pending = oracleSyncPendingMessages.get(group.id) || new Map();
+  pending.set(message.id, message);
+  oracleSyncPendingMessages.set(group.id, pending);
+
   const existing = oracleSyncTimers.get(group.id);
   if (existing) clearTimeout(existing);
 
@@ -198,14 +208,50 @@ function scheduleOracleQuotationCheck(message, group) {
   const quietSeconds = Math.max(5, Math.min(Number(settings.oracle_quiet_period_seconds) || 45, 300));
   const timer = setTimeout(async () => {
     oracleSyncTimers.delete(group.id);
+    const settledMessages = [...(oracleSyncPendingMessages.get(group.id)?.values() || [])]
+      .sort((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp) || Number(left.id) - Number(right.id));
+    oracleSyncPendingMessages.delete(group.id);
     const currentGroup = db.prepare('SELECT * FROM groups WHERE id = ?').get(group.id);
     if (!currentGroup || currentGroup.is_monitored !== 1 || currentGroup.oracle_sync_enabled !== 1) return;
 
-    emitLog(`Checking the settled supplier reply ending at message #${message.id} for complete tyre quotations...`);
-    try {
-      emitOracleResult(await processOracleGroupMessage({ message, group: currentGroup }));
-    } catch (error) {
-      emitLog(`Oracle quotation check could not complete: ${error.message}`);
+    emitLog(`Checking ${settledMessages.length} settled supplier message${settledMessages.length === 1 ? '' : 's'} for quotation-case updates...`);
+    const candidateEventIds = new Set();
+    for (const settledMessage of settledMessages) {
+      try {
+        const result = await processOracleGroupMessage({
+          message: settledMessage,
+          group: currentGroup,
+          allowAutoPublish: false
+        });
+        for (const event of result?.events || []) candidateEventIds.add(event.id);
+        emitOracleResult(result);
+      } catch (error) {
+        emitLog(`Oracle quotation check could not complete for message #${settledMessage.id}: ${error.message}`);
+      }
+    }
+    if (getSettings().oracle_auto_publish === 'true') {
+      for (const eventId of candidateEventIds) {
+        const stored = db.prepare(`
+          SELECT e.sync_status, c.status AS case_status, c.last_reason AS case_last_reason
+          FROM oracle_sync_events e
+          LEFT JOIN oracle_quote_cases c ON c.id = e.case_id
+          WHERE e.id = ?
+        `).get(eventId);
+        if (
+          stored?.sync_status !== 'ready'
+          || (stored.case_status && stored.case_status !== 'ready')
+          || stored.case_last_reason
+        ) continue;
+        try {
+          const publishedEvent = await publishOracleSyncEvent(eventId);
+          emitOracleResult({
+            events: [publishedEvent],
+            case: publishedEvent?.case_id ? getOracleQuoteCaseById(publishedEvent.case_id) : null
+          });
+        } catch (error) {
+          emitLog(`Oracle auto-publish could not complete for quotation #${eventId}: ${error.message}`);
+        }
+      }
     }
   }, quietSeconds * 1000);
   oracleSyncTimers.set(group.id, timer);
@@ -884,6 +930,7 @@ async function handleIncomingMessage(msg, options = {}) {
 
     // Determine message type & text content
     const messageType = Object.keys(msg.message)[0];
+    const replyToWaMessageId = msg.message?.[messageType]?.contextInfo?.stanzaId || null;
     let content = '';
     let mediaObj = null;
     let extractedText = '';
@@ -946,6 +993,7 @@ async function handleIncomingMessage(msg, options = {}) {
       source,
       chat_type: chatType,
       account_id: sock?.user?.id ? jidNormalizedUser(sock.user.id) : null,
+      reply_to_wa_message_id: replyToWaMessageId,
       timestamp
     });
 
@@ -963,6 +1011,7 @@ async function handleIncomingMessage(msg, options = {}) {
       source,
       chat_type: chatType,
       account_id: sock?.user?.id ? jidNormalizedUser(sock.user.id) : null,
+      reply_to_wa_message_id: replyToWaMessageId,
       timestamp
     };
 
@@ -1259,6 +1308,7 @@ export async function shutdownWhatsApp() {
   }
   for (const timer of oracleSyncTimers.values()) clearTimeout(timer);
   oracleSyncTimers.clear();
+  oracleSyncPendingMessages.clear();
 
   const activeSocket = sock;
   sock = null;
