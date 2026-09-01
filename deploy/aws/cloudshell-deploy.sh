@@ -16,15 +16,30 @@ aws s3 cp "$SOURCE_ARCHIVE" "s3://$BUCKET/$SOURCE_KEY" \
 aws s3 cp deploy/aws/install-release.sh "s3://$BUCKET/$DEPLOY_KEY" \
   --region "$REGION" --sse aws:kms --sse-kms-key-id "$KMS_KEY_ARN"
 
-aws cloudformation deploy \
+# Application releases must not update the singleton infrastructure stack.
+# Re-resolving the "latest AMI" parameter can replace the protected instance,
+# while the persistent data volume is still attached to the live singleton.
+# Create the stack when absent, or update it only during an explicitly reviewed
+# infrastructure change.
+if ! aws cloudformation describe-stacks \
   --region "$REGION" \
-  --stack-name "$STACK_NAME" \
-  --template-file deploy/aws/hilite-dedicated-stack.yaml \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides \
-    "SourceArchiveUri=s3://$BUCKET/$SOURCE_KEY" \
-    "ImageTag=$RELEASE_ID" \
-  --tags Environment=production Service=whatsapp-listener
+  --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+  UPDATE_INFRASTRUCTURE=true
+fi
+
+if [ "${UPDATE_INFRASTRUCTURE:-false}" = true ]; then
+  aws cloudformation deploy \
+    --region "$REGION" \
+    --stack-name "$STACK_NAME" \
+    --template-file deploy/aws/hilite-dedicated-stack.yaml \
+    --capabilities CAPABILITY_NAMED_IAM \
+    --parameter-overrides \
+      "SourceArchiveUri=s3://$BUCKET/$SOURCE_KEY" \
+      "ImageTag=$RELEASE_ID" \
+    --tags Environment=production Service=whatsapp-listener
+else
+  printf 'Using existing stack %s; application-only release will not replace infrastructure.\n' "$STACK_NAME"
+fi
 
 BUILD_PROJECT=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK_NAME" \
   --query "Stacks[0].Outputs[?OutputKey=='ImageBuildProjectName'].OutputValue" --output text)
@@ -78,4 +93,3 @@ printf 'STACK_NAME=%s\n' "$STACK_NAME"
 printf 'INSTANCE_ID=%s\n' "$INSTANCE_ID"
 printf 'IMAGE_URI=%s:%s\n' "$REPOSITORY_URI" "$RELEASE_ID"
 printf 'SSM_COMMAND_ID=%s\n' "$COMMAND_ID"
-

@@ -166,6 +166,21 @@ docker compose up -d
 docker compose restart listener
 ```
 
+For the dedicated Hi-Lite production stack, package a clean reviewed commit and
+run the release helper with the printed release ID and archive path:
+
+```bash
+deploy/aws/package-source.sh
+RELEASE_ID=<printed-commit> SOURCE_ARCHIVE=<printed-archive> \
+  deploy/aws/cloudshell-deploy.sh
+```
+
+The helper reuses the existing CloudFormation stack for normal application
+releases, builds a new immutable ECR image, backs up the runtime, and restarts
+the container on the existing singleton. Set `UPDATE_INFRASTRUCTURE=true` only
+for a separately reviewed infrastructure change; an infrastructure update may
+replace the EC2 instance when the latest AMI parameter changes.
+
 Never run `docker compose down -v`, delete `runtime/auth`, press **Logout**, or call `/api/whatsapp/reset` during routine maintenance. Those actions require pairing again.
 
 ## Reliability boundary
