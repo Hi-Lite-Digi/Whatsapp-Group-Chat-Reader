@@ -63,8 +63,8 @@ export default function Navbar({ activeTab, setActiveTab, connState, onConnect, 
         <TabButton id="oracle_sync" label="Quotation Sync" icon={<ArrowRightLeft size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
         <TabButton id="dms" label="Selected DMs" icon={<MessageCircle size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
         <TabButton id="send_message" label="Send Message" icon={<Send size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
-        <TabButton id="live" label="Live Stream" icon={<Activity size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
-        <TabButton id="extractions" label="Extractions Data" icon={<Database size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
+        <TabButton id="live" label="Messages" icon={<Activity size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
+        <TabButton id="extractions" label="Extraction Audit" icon={<Database size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
         <TabButton id="schemas" label="Extraction Schemas" icon={<FileCode size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
         <TabButton id="settings" label="LLM Settings" icon={<Settings size={18} />} activeTab={activeTab} setActiveTab={setActiveTab} />
       </div>

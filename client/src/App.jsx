@@ -340,7 +340,14 @@ export default function App() {
           />
         )}
         {activeTab === 'live' && (
-          <LiveFeedTab liveMessages={liveMessages} logs={logs} />
+          <LiveFeedTab
+            liveMessages={liveMessages}
+            logs={logs}
+            chats={[
+              ...groups.filter(group => group.is_monitored).map(group => ({ ...group, chat_type: 'group' })),
+              ...dms.filter(dm => dm.is_monitored).map(dm => ({ ...dm, chat_type: 'dm' }))
+            ]}
+          />
         )}
         {activeTab === 'extractions' && (
           <ExtractionsTab
