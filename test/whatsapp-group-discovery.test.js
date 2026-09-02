@@ -17,6 +17,7 @@ test('discovers group JIDs from chat, metadata, and message-shaped values', () =
   assert.equal(groupJidFrom({ id: 'first@g.us' }), 'first@g.us');
   assert.equal(groupJidFrom({ jid: 'second@g.us' }), 'second@g.us');
   assert.equal(groupJidFrom({ key: { remoteJid: 'third@g.us' } }), 'third@g.us');
+  assert.equal(groupJidFrom({ key: { remoteJidAlt: 'fourth@g.us' } }), 'fourth@g.us');
   assert.equal(groupJidFrom({ id: 'person@s.whatsapp.net' }), null);
 });
 

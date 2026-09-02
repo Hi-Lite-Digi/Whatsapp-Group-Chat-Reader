@@ -5,7 +5,8 @@ import makeWASocket, {
   downloadContentFromMessage,
   fetchLatestBaileysVersion,
   Browsers,
-  jidNormalizedUser
+  jidNormalizedUser,
+  normalizeMessageContent
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcode from 'qrcode';
@@ -38,7 +39,13 @@ import {
 import { getDisconnectPolicy } from './disconnect-policy.js';
 import { groupJidFrom, groupNameFrom } from './group-discovery.js';
 import { senderIdFromMessage } from './sender-identity.js';
-import { classifyUpsertMessage, isActiveDeliverySource } from './upsert-delivery.js';
+import {
+  classifyUpsertMessage,
+  isActiveDeliverySource,
+  messageChatJid,
+  messageTimestampMs,
+  safeChatReference
+} from './upsert-delivery.js';
 
 const authFolder = process.env.AUTH_FOLDER || './auth_info';
 if (!fs.existsSync(authFolder)) {
@@ -61,6 +68,19 @@ let lastConnectedAt = null;
 let lastMessageAt = null;
 let lastDisconnectAt = null;
 let lastDisconnectReason = null;
+const ingestionState = {
+  upsertBatches: 0,
+  messagesSeen: 0,
+  savedMessages: 0,
+  savedBySource: {},
+  ignoredByReason: {},
+  lastEventAt: null,
+  lastSavedAt: null,
+  lastIgnoredAt: null,
+  lastIgnoredReason: null,
+  lastIgnoredChat: null,
+  lastIgnoredMessageId: null
+};
 const processStartedAt = new Date().toISOString();
 const RECONNECT_BASE_DELAY_MS = Math.max(1000, Number.parseInt(process.env.WHATSAPP_RECONNECT_BASE_DELAY_MS || '5000', 10));
 const RECONNECT_MAX_DELAY_MS = Math.max(RECONNECT_BASE_DELAY_MS, Number.parseInt(process.env.WHATSAPP_RECONNECT_MAX_DELAY_MS || '300000', 10));
@@ -111,8 +131,37 @@ export function getConnectionState() {
     lastDisconnectReason,
     reconnectAttempts,
     reconnectScheduled: Boolean(reconnectTimer),
-    reconnectSuppressed
+    reconnectSuppressed,
+    ingestion: {
+      ...ingestionState,
+      savedBySource: { ...ingestionState.savedBySource },
+      ignoredByReason: { ...ingestionState.ignoredByReason }
+    }
   };
+}
+
+function recordIngestionResult(msg, delivery, result) {
+  const now = new Date().toISOString();
+  const messageId = msg?.key?.id || null;
+  const chatJid = messageChatJid(msg);
+  ingestionState.messagesSeen++;
+  ingestionState.lastEventAt = now;
+
+  if (result?.saved) {
+    ingestionState.savedMessages++;
+    ingestionState.savedBySource[delivery.source] = (ingestionState.savedBySource[delivery.source] || 0) + 1;
+    ingestionState.lastSavedAt = now;
+    emitLog(`WhatsApp ingestion saved ${delivery.source} message ${messageId || '<no id>'} for ${safeChatReference(chatJid)}.`);
+    return;
+  }
+
+  const reason = result?.reason || 'unknown';
+  ingestionState.ignoredByReason[reason] = (ingestionState.ignoredByReason[reason] || 0) + 1;
+  ingestionState.lastIgnoredAt = now;
+  ingestionState.lastIgnoredReason = reason;
+  ingestionState.lastIgnoredChat = safeChatReference(chatJid);
+  ingestionState.lastIgnoredMessageId = messageId;
+  emitLog(`WhatsApp ingestion ignored ${delivery.source} message ${messageId || '<no id>'} for ${safeChatReference(chatJid)} (${reason}).`);
 }
 
 function reconnectDelayMs(isRateLimited = false) {
@@ -626,15 +675,17 @@ async function initializeWhatsAppClient() {
     });
 
     sock.ev.on('messages.upsert', async (m) => {
-      for (const msg of m.messages) {
+      ingestionState.upsertBatches++;
+      for (const msg of m.messages || []) {
         const delivery = classifyUpsertMessage(m.type, msg, { catchupWindowMs: CATCHUP_WINDOW_MS });
-        emitLog(`WhatsApp message event received (${m.type || 'unknown'} → ${delivery.source}).`);
-        await handleIncomingMessage(msg, {
+        const result = await handleIncomingMessage(msg, {
           source: delivery.source,
           downloadMedia: delivery.activeDelivery,
           runExtraction: delivery.activeDelivery
         });
+        recordIngestionResult(msg, delivery, result);
       }
+      broadcastState();
     });
 
     // Full history is delivered separately from live messages. Keep a bounded,
@@ -663,7 +714,7 @@ async function initializeWhatsAppClient() {
       }
 
       for (const msg of messages) {
-        const remoteJid = msg?.key?.remoteJid;
+        const remoteJid = messageChatJid(msg);
         const chatType = chatTypeForJid(remoteJid);
         if (!chatType || !msg.message) continue;
 
@@ -897,10 +948,12 @@ async function handleIncomingMessage(msg, options = {}) {
       runExtraction = isActiveDeliverySource(source)
     } = options;
     const activeDelivery = isActiveDeliverySource(source);
-    if (!msg || !msg.message) return;
-    const remoteJid = msg.key.remoteJid;
+    if (!msg) return { saved: false, reason: 'missing_event' };
+    const normalizedMessage = normalizeMessageContent(msg.message);
+    if (!normalizedMessage) return { saved: false, reason: 'missing_message' };
+    const remoteJid = messageChatJid(msg);
     const chatType = chatTypeForJid(remoteJid);
-    if (!chatType) return;
+    if (!chatType) return { saved: false, reason: 'unsupported_chat' };
 
     let chatRecord;
     if (chatType === 'group') {
@@ -913,7 +966,8 @@ async function handleIncomingMessage(msg, options = {}) {
       }
     } else {
       const aliases = dmJidsFrom(msg);
-      if (aliases.some(isOwnDirectJid)) return;
+      if (!aliases.includes(remoteJid)) aliases.push(remoteJid);
+      if (aliases.some(isOwnDirectJid)) return { saved: false, reason: 'own_chat' };
       chatRecord = upsertDmFromJids(aliases, msg.key?.fromMe ? '' : msg.pushName);
       rememberDmHistoryAnchor(chatRecord?.id, msg);
       emitDmUpdates();
@@ -925,33 +979,33 @@ async function handleIncomingMessage(msg, options = {}) {
     const chatId = chatType === 'group' ? remoteJid : chatRecord.id;
     const chatName = chatRecord.name || remoteJid.split('@')[0];
     const senderId = senderIdFromMessage(msg, sock?.user?.id || 'self');
-    const senderName = msg.key.fromMe
+    const senderName = msg.key?.fromMe
       ? (sock?.user?.name || 'You')
       : (msg.pushName || chatRecord.name || senderId.split('@')[0]);
-    const messageId = msg.key.id;
+    const messageId = msg.key?.id;
     if (!messageId) return { saved: false, reason: 'missing_id' };
     if (db.prepare('SELECT 1 FROM messages WHERE wa_message_id = ?').get(messageId)) {
       return { saved: false, reason: 'duplicate' };
     }
-    const timestamp = new Date((msg.messageTimestamp || Date.now() / 1000) * 1000).toISOString();
-    if (activeDelivery) lastMessageAt = timestamp;
+    const timestamp = new Date(messageTimestampMs(msg) || Date.now()).toISOString();
 
     // Determine message type & text content
-    const messageType = Object.keys(msg.message)[0];
-    const replyToWaMessageId = msg.message?.[messageType]?.contextInfo?.stanzaId || null;
+    const messageType = Object.keys(normalizedMessage)[0];
+    if (!messageType) return { saved: false, reason: 'missing_message_type' };
+    const replyToWaMessageId = normalizedMessage?.[messageType]?.contextInfo?.stanzaId || null;
     let content = '';
     let mediaObj = null;
     let extractedText = '';
 
     if (messageType === 'conversation') {
-      content = msg.message.conversation;
+      content = normalizedMessage.conversation;
     } else if (messageType === 'extendedTextMessage') {
-      content = msg.message.extendedTextMessage.text;
+      content = normalizedMessage.extendedTextMessage.text;
     } else if (messageType === 'imageMessage') {
-      content = msg.message.imageMessage.caption || '[Image Message]';
-      if (downloadMedia) mediaObj = await downloadAndProcessMedia(msg.message.imageMessage, 'image', 'imageMessage');
+      content = normalizedMessage.imageMessage.caption || '[Image Message]';
+      if (downloadMedia) mediaObj = await downloadAndProcessMedia(normalizedMessage.imageMessage, 'image', 'imageMessage');
     } else if (messageType === 'documentMessage') {
-      const doc = msg.message.documentMessage;
+      const doc = normalizedMessage.documentMessage;
       content = doc.caption || `[Document: ${doc.fileName || 'file'}]`;
       if (downloadMedia) mediaObj = await downloadAndProcessMedia(doc, 'document', 'documentMessage', doc.fileName);
       if (mediaObj && mediaObj.extractedText) {
@@ -959,10 +1013,10 @@ async function handleIncomingMessage(msg, options = {}) {
       }
     } else if (messageType === 'audioMessage') {
       content = '[Audio Message]';
-      if (downloadMedia) mediaObj = await downloadAndProcessMedia(msg.message.audioMessage, 'audio', 'audioMessage');
+      if (downloadMedia) mediaObj = await downloadAndProcessMedia(normalizedMessage.audioMessage, 'audio', 'audioMessage');
     } else if (messageType === 'videoMessage') {
-      content = msg.message.videoMessage.caption || '[Video Message]';
-      if (downloadMedia) mediaObj = await downloadAndProcessMedia(msg.message.videoMessage, 'video', 'videoMessage');
+      content = normalizedMessage.videoMessage.caption || '[Video Message]';
+      if (downloadMedia) mediaObj = await downloadAndProcessMedia(normalizedMessage.videoMessage, 'video', 'videoMessage');
     } else {
       content = `[${messageType}]`;
     }
@@ -1005,6 +1059,8 @@ async function handleIncomingMessage(msg, options = {}) {
       reply_to_wa_message_id: replyToWaMessageId,
       timestamp
     });
+    if (!dbMessageId) return { saved: false, reason: 'save_failed' };
+    if (activeDelivery) lastMessageAt = timestamp;
 
     const fullMsgPayload = {
       id: dbMessageId,

@@ -109,7 +109,8 @@ app.get('/health/ready', (req, res) => {
       lastDisconnectReason: whatsapp.lastDisconnectReason,
       reconnectAttempts: whatsapp.reconnectAttempts,
       reconnectScheduled: whatsapp.reconnectScheduled,
-      reconnectSuppressed: whatsapp.reconnectSuppressed
+      reconnectSuppressed: whatsapp.reconnectSuppressed,
+      ingestion: whatsapp.ingestion
     }
   });
 });

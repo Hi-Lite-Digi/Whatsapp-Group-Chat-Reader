@@ -41,3 +41,35 @@ export function classifyUpsertMessage(type, message, options = {}) {
 export function isActiveDeliverySource(source) {
   return source === 'realtime' || source === 'catchup';
 }
+
+function isDirectJid(value) {
+  return typeof value === 'string'
+    && (value.endsWith('@s.whatsapp.net') || value.endsWith('@lid'));
+}
+
+function isGroupJid(value) {
+  return typeof value === 'string' && value.endsWith('@g.us');
+}
+
+export function messageChatJid(message) {
+  const candidates = [
+    message?.key?.remoteJid,
+    message?.key?.remoteJidAlt,
+    message?.remoteJid,
+    message?.jid,
+    message?.chatId
+  ];
+
+  // Prefer a group identifier when an event contains both a canonical group
+  // JID and an alternate direct-addressing JID.
+  return candidates.find(isGroupJid)
+    || candidates.find(isDirectJid)
+    || null;
+}
+
+export function safeChatReference(jid) {
+  if (typeof jid !== 'string' || !jid) return 'unknown';
+  if (jid.endsWith('@g.us')) return jid;
+  const server = jid.split('@')[1];
+  return server ? `redacted@${server}` : 'unsupported';
+}

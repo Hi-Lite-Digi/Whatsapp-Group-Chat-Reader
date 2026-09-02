@@ -9,6 +9,7 @@ export function groupJidFrom(value) {
     value?.id,
     value?.jid,
     value?.key?.remoteJid,
+    value?.key?.remoteJidAlt,
     value?.remoteJid
   ];
   return candidates.find(isGroupJid) || null;
