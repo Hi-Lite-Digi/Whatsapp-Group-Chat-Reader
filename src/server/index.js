@@ -43,7 +43,8 @@ import {
   importBufferedHistoryForGroup,
   importBufferedHistoryForDm,
   requestHistoryForGroup,
-  requestHistoryForDm
+  requestHistoryForDm,
+  recoverGroupHistoryFromAnchor
 } from '../whatsapp/client.js';
 import {
   getOracleConfiguration,
@@ -212,6 +213,20 @@ app.post('/api/whatsapp/reset', async (req, res) => {
 app.post('/api/whatsapp/logout', async (req, res) => {
   await disconnectWhatsApp();
   res.json({ message: 'WhatsApp session logged out' });
+});
+
+app.post('/api/whatsapp/recover-group-history', async (req, res) => {
+  try {
+    const result = await recoverGroupHistoryFromAnchor({
+      groupId: String(req.body.groupId || '').trim(),
+      messageId: String(req.body.messageId || '').trim(),
+      timestamp: req.body.timestamp,
+      count: req.body.count
+    });
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
 });
 
 

@@ -6,7 +6,8 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   Browsers,
   jidNormalizedUser,
-  normalizeMessageContent
+  normalizeMessageContent,
+  WAMessageStubType
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcode from 'qrcode';
@@ -79,7 +80,14 @@ const ingestionState = {
   lastIgnoredAt: null,
   lastIgnoredReason: null,
   lastIgnoredChat: null,
-  lastIgnoredMessageId: null
+  lastIgnoredMessageId: null,
+  lastIgnoredStubType: null,
+  recoveryScheduled: 0,
+  recoveryRequests: 0,
+  recoveryHistoryRequests: 0,
+  recoveryResolved: 0,
+  recoveryExhausted: 0,
+  pendingRecoveries: 0
 };
 const processStartedAt = new Date().toISOString();
 const RECONNECT_BASE_DELAY_MS = Math.max(1000, Number.parseInt(process.env.WHATSAPP_RECONNECT_BASE_DELAY_MS || '5000', 10));
@@ -102,6 +110,8 @@ const groupHistoryPageCounts = new Map();
 const exhaustedGroupHistory = new Set();
 const oracleSyncTimers = new Map();
 const oracleSyncPendingMessages = new Map();
+const missingMessageRecoveries = new Map();
+const MISSING_MESSAGE_RECOVERY_DELAYS_MS = [12_000, 45_000, 120_000];
 const MAX_HISTORY_PER_GROUP = Math.max(1, Number.parseInt(process.env.HISTORY_BUFFER_PER_GROUP || '500', 10));
 const MAX_HISTORY_TOTAL = Math.max(MAX_HISTORY_PER_GROUP, Number.parseInt(process.env.HISTORY_BUFFER_TOTAL || '5000', 10));
 const MAX_DM_HISTORY_PER_CHAT = Math.max(1, Number.parseInt(process.env.DM_HISTORY_BUFFER_PER_CHAT || '500', 10));
@@ -161,7 +171,90 @@ function recordIngestionResult(msg, delivery, result) {
   ingestionState.lastIgnoredReason = reason;
   ingestionState.lastIgnoredChat = safeChatReference(chatJid);
   ingestionState.lastIgnoredMessageId = messageId;
+  ingestionState.lastIgnoredStubType = msg?.messageStubType ?? null;
   emitLog(`WhatsApp ingestion ignored ${delivery.source} message ${messageId || '<no id>'} for ${safeChatReference(chatJid)} (${reason}).`);
+}
+
+function completeMissingMessageRecovery(messageId) {
+  if (!messageId) return false;
+  const recovery = missingMessageRecoveries.get(messageId);
+  if (!recovery) return false;
+  if (recovery.timer) clearTimeout(recovery.timer);
+  missingMessageRecoveries.delete(messageId);
+  ingestionState.pendingRecoveries = missingMessageRecoveries.size;
+  ingestionState.recoveryResolved++;
+  emitLog(`Recovered decryptable content for WhatsApp message ${messageId}.`);
+  return true;
+}
+
+function clearMissingMessageRecoveries() {
+  for (const recovery of missingMessageRecoveries.values()) {
+    if (recovery.timer) clearTimeout(recovery.timer);
+  }
+  missingMessageRecoveries.clear();
+  ingestionState.pendingRecoveries = 0;
+}
+
+function scheduleMissingMessageRecovery(msg, chatRecord) {
+  const messageId = msg?.key?.id;
+  if (!messageId || !sock || missingMessageRecoveries.has(messageId)) return false;
+
+  const recovery = { attempt: 0, timer: null };
+  missingMessageRecoveries.set(messageId, recovery);
+  ingestionState.recoveryScheduled++;
+  ingestionState.pendingRecoveries = missingMessageRecoveries.size;
+
+  const runAttempt = async () => {
+    if (!missingMessageRecoveries.has(messageId)) return;
+    if (db.prepare('SELECT 1 FROM messages WHERE wa_message_id = ?').get(messageId)) {
+      completeMissingMessageRecovery(messageId);
+      return;
+    }
+    if (!sock || connectionStatus !== 'connected') {
+      recovery.timer = setTimeout(runAttempt, MISSING_MESSAGE_RECOVERY_DELAYS_MS[0]);
+      recovery.timer.unref?.();
+      return;
+    }
+
+    recovery.attempt++;
+    try {
+      ingestionState.recoveryRequests++;
+      const requestId = await sock.requestPlaceholderResend(msg.key, msg);
+      emitLog(`Requested WhatsApp content recovery for ${safeChatReference(messageChatJid(msg))} message ${messageId} (attempt ${recovery.attempt}${requestId ? `; request ${requestId}` : ''}).`);
+    } catch (error) {
+      emitLog(`WhatsApp content recovery request failed for message ${messageId}: ${error.message}`);
+    }
+
+    // A history request recovers nearby messages that may have been missed
+    // before this placeholder, not just the one event that exposed the gap.
+    if (recovery.attempt === 2 && msg.messageTimestamp) {
+      try {
+        ingestionState.recoveryHistoryRequests++;
+        const requestId = await sock.fetchMessageHistory(50, msg.key, msg.messageTimestamp);
+        emitLog(`Requested recent group history to recover the message gap in ${chatRecord.name || messageChatJid(msg)}${requestId ? ` (request ${requestId})` : ''}.`);
+      } catch (error) {
+        emitLog(`Recent group-history recovery failed for ${chatRecord.name || messageChatJid(msg)}: ${error.message}`);
+      }
+    }
+
+    if (recovery.attempt >= MISSING_MESSAGE_RECOVERY_DELAYS_MS.length) {
+      missingMessageRecoveries.delete(messageId);
+      ingestionState.pendingRecoveries = missingMessageRecoveries.size;
+      ingestionState.recoveryExhausted++;
+      emitLog(`WhatsApp content recovery exhausted for message ${messageId}; the event remains visible in ingestion diagnostics.`);
+      broadcastState();
+      return;
+    }
+
+    recovery.timer = setTimeout(runAttempt, MISSING_MESSAGE_RECOVERY_DELAYS_MS[recovery.attempt]);
+    recovery.timer.unref?.();
+    broadcastState();
+  };
+
+  recovery.timer = setTimeout(runAttempt, MISSING_MESSAGE_RECOVERY_DELAYS_MS[0]);
+  recovery.timer.unref?.();
+  emitLog(`Scheduled content recovery for placeholder message ${messageId} in ${chatRecord.name || messageChatJid(msg)}.`);
+  return true;
 }
 
 function reconnectDelayMs(isRateLimited = false) {
@@ -365,6 +458,7 @@ export async function clearAuthSession(options = {}) {
   requestedGroupHistory.clear();
   groupHistoryPageCounts.clear();
   exhaustedGroupHistory.clear();
+  clearMissingMessageRecoveries();
   pendingGroupHistoryTotal = 0;
   pendingDmHistoryTotal = 0;
   emitLog('Cleared auth session files. Ready for fresh pairing.');
@@ -691,7 +785,14 @@ async function initializeWhatsAppClient() {
     // Full history is delivered separately from live messages. Keep a bounded,
     // in-memory buffer for paused chats so the user can opt in before message
     // bodies are written to disk. Enabling a chat imports its buffered history.
-    sock.ev.on('messaging-history.set', async ({ messages = [], contacts = [], chats = [], progress, isLatest }) => {
+    sock.ev.on('messaging-history.set', async ({
+      messages = [],
+      contacts = [],
+      chats = [],
+      progress,
+      isLatest,
+      peerDataRequestSessionId
+    }) => {
       let importedGroups = 0;
       let importedDms = 0;
       let bufferedGroups = 0;
@@ -732,11 +833,15 @@ async function initializeWhatsAppClient() {
         }
 
         if (chatRecord?.is_monitored === 1) {
+          const recoveredDelivery = peerDataRequestSessionId
+            ? { source: 'catchup', activeDelivery: true }
+            : { source: 'history', activeDelivery: false };
           const result = await handleIncomingMessage(msg, {
-            source: 'history',
-            downloadMedia: false,
-            runExtraction: false
+            source: recoveredDelivery.source,
+            downloadMedia: recoveredDelivery.activeDelivery,
+            runExtraction: recoveredDelivery.activeDelivery
           });
+          if (peerDataRequestSessionId) recordIngestionResult(msg, recoveredDelivery, result);
           if (result?.saved) {
             if (chatType === 'group') importedGroups++;
             else importedDms++;
@@ -753,7 +858,7 @@ async function initializeWhatsAppClient() {
         emitGroupUpdates();
       }
       if (discoveredDms > 0) emitDmUpdates();
-      emitLog(`History sync chunk received${progress != null ? ` (${progress}% complete)` : ''}: ${importedGroups} group + ${importedDms} DM messages imported; ${bufferedGroups} group + ${bufferedDms} DM messages held in memory pending selection${isLatest ? ' (latest sync)' : ''}.`);
+      emitLog(`${peerDataRequestSessionId ? 'On-demand recovery' : 'History sync'} chunk received${progress != null ? ` (${progress}% complete)` : ''}: ${importedGroups} group + ${importedDms} DM messages imported; ${bufferedGroups} group + ${bufferedDms} DM messages held in memory pending selection${isLatest ? ' (latest sync)' : ''}.`);
       broadcastState();
 
       for (const [groupId, requestedAnchorId] of [...requestedGroupHistory.entries()]) {
@@ -940,6 +1045,33 @@ export async function requestHistoryForGroup(groupId, options = {}) {
   }
 }
 
+export async function recoverGroupHistoryFromAnchor({ groupId, messageId, timestamp, count = 100 }) {
+  if (!sock || connectionStatus !== 'connected') {
+    throw new Error('WhatsApp is not connected.');
+  }
+  const group = db.prepare('SELECT id, name, is_monitored FROM groups WHERE id = ?').get(groupId);
+  if (!group || group.is_monitored !== 1) {
+    throw new Error('The WhatsApp group is not monitored.');
+  }
+  if (typeof messageId !== 'string' || !messageId.trim()) {
+    throw new Error('A WhatsApp message anchor ID is required.');
+  }
+  const timestampMs = Date.parse(timestamp);
+  if (!Number.isFinite(timestampMs)) {
+    throw new Error('A valid message anchor timestamp is required.');
+  }
+  const safeCount = Math.max(1, Math.min(Number(count) || 100, 500));
+  const requestId = await sock.fetchMessageHistory(
+    safeCount,
+    { remoteJid: group.id, fromMe: false, id: messageId.trim() },
+    Math.floor(timestampMs / 1000)
+  );
+  ingestionState.recoveryHistoryRequests++;
+  emitLog(`Requested up to ${safeCount} recent messages to repair the ingestion gap in ${group.name}${requestId ? ` (request ${requestId})` : ''}.`);
+  broadcastState();
+  return { requested: true, groupId: group.id, count: safeCount, requestId: requestId || null };
+}
+
 async function handleIncomingMessage(msg, options = {}) {
   try {
     const {
@@ -949,8 +1081,6 @@ async function handleIncomingMessage(msg, options = {}) {
     } = options;
     const activeDelivery = isActiveDeliverySource(source);
     if (!msg) return { saved: false, reason: 'missing_event' };
-    const normalizedMessage = normalizeMessageContent(msg.message);
-    if (!normalizedMessage) return { saved: false, reason: 'missing_message' };
     const remoteJid = messageChatJid(msg);
     const chatType = chatTypeForJid(remoteJid);
     if (!chatType) return { saved: false, reason: 'unsupported_chat' };
@@ -976,13 +1106,26 @@ async function handleIncomingMessage(msg, options = {}) {
       return { saved: false, reason: 'not_monitored' };
     }
 
+    const messageId = msg.key?.id;
+    const normalizedMessage = normalizeMessageContent(msg.message);
+    if (!normalizedMessage) {
+      const isCiphertextPlaceholder = msg.messageStubType === WAMessageStubType.CIPHERTEXT;
+      if (chatType === 'group' && isCiphertextPlaceholder) {
+        scheduleMissingMessageRecovery(msg, chatRecord);
+      }
+      return {
+        saved: false,
+        reason: isCiphertextPlaceholder ? 'ciphertext_placeholder' : 'missing_message'
+      };
+    }
+    completeMissingMessageRecovery(messageId);
+
     const chatId = chatType === 'group' ? remoteJid : chatRecord.id;
     const chatName = chatRecord.name || remoteJid.split('@')[0];
     const senderId = senderIdFromMessage(msg, sock?.user?.id || 'self');
     const senderName = msg.key?.fromMe
       ? (sock?.user?.name || 'You')
       : (msg.pushName || chatRecord.name || senderId.split('@')[0]);
-    const messageId = msg.key?.id;
     if (!messageId) return { saved: false, reason: 'missing_id' };
     if (db.prepare('SELECT 1 FROM messages WHERE wa_message_id = ?').get(messageId)) {
       return { saved: false, reason: 'duplicate' };
@@ -1374,6 +1517,7 @@ export async function shutdownWhatsApp() {
   for (const timer of oracleSyncTimers.values()) clearTimeout(timer);
   oracleSyncTimers.clear();
   oracleSyncPendingMessages.clear();
+  clearMissingMessageRecoveries();
 
   const activeSocket = sock;
   sock = null;
