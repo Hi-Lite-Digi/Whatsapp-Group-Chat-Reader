@@ -824,6 +824,30 @@ export function getOracleQuoteCaseMessages(caseId) {
   `).all(activeAccount, caseId);
 }
 
+export function getOracleQuoteCaseContextMessages(caseId, windowMinutes = 60) {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return [];
+  const caseItem = getOracleQuoteCaseById(caseId);
+  if (!caseItem) return [];
+  const openedAtMs = Date.parse(caseItem.opened_at);
+  const lastActivityMs = Date.parse(caseItem.last_activity_at);
+  if (!Number.isFinite(openedAtMs) || !Number.isFinite(lastActivityMs)) return [];
+  const safeMinutes = Math.max(1, Math.min(Number(windowMinutes) || 60, 1440));
+  const contextStart = new Date(openedAtMs - safeMinutes * 60_000).toISOString();
+  const contextEnd = new Date(lastActivityMs).toISOString();
+
+  return db.prepare(`
+    SELECT id, wa_message_id, group_id, sender_id, sender_name, message_type,
+      content, extracted_text, media_path, media_mime, source,
+      reply_to_wa_message_id, timestamp
+    FROM messages
+    WHERE account_id = ? AND group_id = ? AND chat_type = 'group'
+      AND timestamp >= ? AND timestamp <= ?
+    ORDER BY timestamp ASC, id ASC
+    LIMIT 200
+  `).all(activeAccount, caseItem.group_id, contextStart, contextEnd);
+}
+
 export function getOracleQuoteRunsForCase(caseId) {
   const activeAccount = getActiveWhatsappAccount();
   if (!activeAccount) return [];

@@ -30,8 +30,19 @@ function reasonLabel(reason) {
     no_quote_items: 'No definite new-tyre quotation item could be extracted.',
     failed_evidence_validation: 'The extracted values were not supported by the source messages.',
     negative_availability_only: 'The supplier said stock was unavailable, so no quotation could be created.',
+    no_supplier_price: 'The supplier message contained no explicit quotation price.',
+    no_tyre_size: 'No valid tyre size was present in the correlated messages.',
+    unsupported_product: 'The conversation was about an unsupported product rather than a new tyre quotation.',
+    logistics_or_acknowledgement: 'The message was logistics or acknowledgement text, not quotation evidence.',
+    acknowledgement_only: 'The supplier only acknowledged the conversation and supplied no new quotation evidence.',
+    unrelated_confirmation: 'The confirmation could not be tied safely to a tyre quotation request.',
+    requester_message: 'The message came from the requester, so it could not trigger a supplier quotation.',
+    current_message_missing: 'The triggering message was not present in the bounded case context.',
     ambiguous_case_match: 'The message could relate to more than one open quotation case.',
-    llm_failure: 'The quotation extraction service could not complete the check.'
+    invalid_supplier_mapping: 'The configured supplier could not be verified against Oracle.',
+    duplicate_quotes: 'The same quotation candidate had already been recorded.',
+    llm_failure: 'The quotation extraction service could not complete the check.',
+    pipeline_error: 'The quotation pipeline encountered an internal processing error.'
   }[reason] || reason || 'No blocking reason was recorded.';
 }
 
@@ -145,6 +156,24 @@ export default function CaseEvidencePanel({ audit, loading, onClose, onRefresh }
                 );
               })}
               {(audit.messages || []).length === 0 && <div style={{ color: 'var(--text-muted)', padding: '16px 0' }}>No source messages are attached to this case.</div>}
+            </div>
+          </div>
+
+          <div style={{ marginTop: '24px' }}>
+            <h4 style={{ display: 'flex', gap: '8px', alignItems: 'center', fontSize: '0.95rem' }}><Clock3 size={18} color="var(--accent-amber)" /> Full surrounding group context</h4>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '5px', lineHeight: 1.5 }}>All stored messages from the same group within the {audit.context_window_minutes || 60}-minute correlation horizon leading up to the case’s last activity. This makes excluded context visible without implying that it influenced the quotation.</p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '13px' }}>
+              {(audit.context_messages || []).map(message => (
+                <div key={message.id} style={{ display: 'grid', gridTemplateColumns: 'minmax(125px, auto) minmax(120px, 180px) 1fr', gap: '12px', alignItems: 'start', padding: '11px 12px', borderRadius: '10px', background: message.included_in_case ? 'rgba(37, 211, 102, 0.07)' : 'rgba(255,255,255,0.025)', border: `1px solid ${message.included_in_case ? 'rgba(37, 211, 102, 0.19)' : 'var(--border-color)'}` }}>
+                  <div style={{ color: 'var(--text-dim)', fontSize: '0.72rem', whiteSpace: 'nowrap' }}>{localTime(message.timestamp)}</div>
+                  <div style={{ minWidth: 0 }}><strong style={{ fontSize: '0.8rem' }}>{message.sender_name || message.sender_id}</strong><div style={{ marginTop: '5px' }}><span className={message.included_in_case ? 'badge badge-success' : 'badge badge-info'}>{message.included_in_case ? 'Used by case' : 'Context only'}</span></div></div>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', lineHeight: 1.45, color: message.message_type === 'senderKeyDistributionMessage' ? 'var(--text-dim)' : 'var(--text-main)' }}>{message.content || `[${message.message_type || 'message'}]`}</div>
+                    {message.exclusion_reason && <div style={{ color: 'var(--text-dim)', fontSize: '0.71rem', marginTop: '5px' }}>{message.exclusion_reason}</div>}
+                  </div>
+                </div>
+              ))}
+              {(audit.context_messages || []).length === 0 && <div style={{ color: 'var(--text-muted)', padding: '12px 0' }}>No surrounding messages were stored within the case horizon.</div>}
             </div>
           </div>
 

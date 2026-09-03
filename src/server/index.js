@@ -21,6 +21,7 @@ import {
   getSettings,
   updateSettings,
   getOracleQuoteCaseById,
+  getOracleQuoteCaseContextMessages,
   getOracleQuoteCaseMessages,
   getOracleQuoteCases,
   getOracleQuoteRunsForCase,
@@ -580,11 +581,27 @@ app.get('/api/oracle/cases/:id/audit', (req, res) => {
     ...message,
     triggered_run_ids: triggerRunIdsByMessage.get(message.id) || []
   }));
+  const attachedMessageIds = new Set(messages.map(message => message.id));
+  const group = db.prepare('SELECT oracle_supplier_sender_ids FROM groups WHERE id = ?').get(caseItem.group_id);
+  const supplierSenderIds = new Set(String(group?.oracle_supplier_sender_ids || '').split(/[\s,]+/).filter(Boolean));
+  const caseLifetimeMinutes = Math.max(15, Math.min(Number(getSettings().oracle_case_lifetime_minutes) || 60, 1440));
+  const contextMessages = getOracleQuoteCaseContextMessages(caseId, caseLifetimeMinutes).map(message => ({
+    ...message,
+    role: supplierSenderIds.has(message.sender_id) ? 'supplier' : 'requester',
+    included_in_case: attachedMessageIds.has(message.id),
+    exclusion_reason: attachedMessageIds.has(message.id)
+      ? null
+      : message.message_type === 'senderKeyDistributionMessage'
+        ? 'WhatsApp encryption protocol event; not conversational content.'
+        : 'Nearby message not attached by the quotation correlation rules.'
+  }));
 
   res.setHeader('Cache-Control', 'no-store');
   res.json({
     case: caseItem,
     messages,
+    context_messages: contextMessages,
+    context_window_minutes: caseLifetimeMinutes,
     runs,
     events: getOracleSyncEventsForCase(caseId)
   });

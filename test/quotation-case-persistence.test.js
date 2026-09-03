@@ -159,6 +159,8 @@ test('re-opens an incomplete case when a related fragment arrives outside the qu
     assert.equal(auditMessages[0].message_type, 'conversation');
     assert.equal(auditMessages[0].source, 'realtime');
     assert.equal(auditMessages[1].role, 'supplier');
+    const contextMessages = database.getOracleQuoteCaseContextMessages(thirdResolution.caseRecord.id, 60);
+    assert.deepEqual(contextMessages.map(message => message.id), [requestId, priceId, modelId, stockId]);
 
     const auditRun = database.createOracleQuoteRun({
       group_id: group.id,
