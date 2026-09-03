@@ -61,7 +61,7 @@ secret_json=$(aws secretsmanager get-secret-value \
   --query SecretString \
   --output text)
 printf '%s' "$secret_json" | jq -r '
-  ["OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "ORACLE_API_TOKEN"] as $allowed
+  ["OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "ORACLE_API_TOKEN", "MONITOR_TOKEN"] as $allowed
   | to_entries[]
   | select(.key as $key | $allowed | index($key))
   | select(.value != null)

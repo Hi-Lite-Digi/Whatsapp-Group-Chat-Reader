@@ -34,6 +34,11 @@ Parameters:
     Default: 65
     MinValue: 1
     MaxValue: 50000
+  MonitorListenerRulePriority:
+    Type: Number
+    Default: 64
+    MinValue: 1
+    MaxValue: 50000
   InstanceType:
     Type: String
     Default: t4g.medium
@@ -539,6 +544,24 @@ Resources:
             SessionTimeout: 604800
         - Type: forward
           Order: 2
+          TargetGroupArn: !Ref ListenerTargetGroup
+
+  MonitorListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListenerArn
+      Priority: !Ref MonitorListenerRulePriority
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values:
+              - !Ref DashboardDomain
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /monitor/*
+      Actions:
+        - Type: forward
           TargetGroupArn: !Ref ListenerTargetGroup
 
   BackupVault:

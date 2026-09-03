@@ -5,6 +5,7 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
+import { monitorAuthorized, summarizeQueue } from './monitoring.js';
 
 import {
   initDatabase,
@@ -91,6 +92,56 @@ if (!fs.existsSync(mediaFolder)) {
 app.use('/media', express.static(mediaFolder));
 
 // API Routes
+
+function requireMonitorToken(req, res, next) {
+  if (!process.env.MONITOR_TOKEN) {
+    return res.status(503).json({ ok: false, status: 'not_configured' });
+  }
+  if (!monitorAuthorized(req.headers.authorization)) {
+    return res.status(401).json({ ok: false, status: 'unauthorized' });
+  }
+  res.set('Cache-Control', 'no-store');
+  return next();
+}
+
+app.use('/monitor', requireMonitorToken);
+
+app.get('/monitor/live', (req, res) => {
+  res.json({ status: 'ok', lastSeenAt: new Date().toISOString(), uptimeSeconds: Math.round(process.uptime()) });
+});
+
+app.get('/monitor/ready', (req, res) => {
+  const whatsapp = getConnectionState();
+  const ready = whatsapp.status === 'connected';
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ready' : 'not_ready',
+    lastConnectedAt: whatsapp.lastConnectedAt,
+    lastMessageAt: whatsapp.lastMessageAt,
+    reconnectAttempts: whatsapp.reconnectAttempts,
+    reconnectScheduled: whatsapp.reconnectScheduled,
+    reconnectSuppressed: whatsapp.reconnectSuppressed,
+    ingestion: whatsapp.ingestion
+  });
+});
+
+app.get('/monitor/queue', (req, res) => {
+  const cases = getOracleQuoteCases(500);
+  res.json({ status: 'ok', ...summarizeQueue(cases) });
+});
+
+app.get('/monitor/oracle', async (req, res) => {
+  const configuration = getOracleConfiguration();
+  if (!configuration.configured) {
+    return res.status(503).json({ ok: false, status: 'not_configured', message: 'Oracle API is not configured.' });
+  }
+  try {
+    await pingOracle();
+    const suppliers = await getOracleSuppliers();
+    return res.json({ ok: true, status: 'connected', supplierCount: suppliers.length });
+  } catch (error) {
+    return res.status(502).json({ ok: false, status: 'down', message: error.message });
+  }
+});
 
 app.get('/health/live', (req, res) => {
   res.json({ status: 'ok', uptimeSeconds: Math.round(process.uptime()) });
