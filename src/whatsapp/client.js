@@ -39,8 +39,13 @@ import {
 } from '../oracle/sync.js';
 import { getDisconnectPolicy } from './disconnect-policy.js';
 import { groupJidFrom, groupNameFrom } from './group-discovery.js';
-import { senderIdFromMessage } from './sender-identity.js';
 import {
+  canonicalPhoneJid,
+  resolvedSenderIdFromMessage,
+  senderIdFromMessage
+} from './sender-identity.js';
+import {
+  classifyHistoryMessage,
   classifyUpsertMessage,
   isActiveDeliverySource,
   messageChatJid,
@@ -87,7 +92,11 @@ const ingestionState = {
   recoveryHistoryRequests: 0,
   recoveryResolved: 0,
   recoveryExhausted: 0,
-  pendingRecoveries: 0
+  pendingRecoveries: 0,
+  senderMappingsResolved: 0,
+  senderMappingsUnresolved: 0,
+  reconciledSenderRows: 0,
+  recoveredHistoryQuotationChecks: 0
 };
 const processStartedAt = new Date().toISOString();
 const RECONNECT_BASE_DELAY_MS = Math.max(1000, Number.parseInt(process.env.WHATSAPP_RECONNECT_BASE_DELAY_MS || '5000', 10));
@@ -119,6 +128,8 @@ const MAX_DM_HISTORY_TOTAL = Math.max(MAX_DM_HISTORY_PER_CHAT, Number.parseInt(p
 const MAX_GROUP_HISTORY_PAGES = Math.max(1, Number.parseInt(process.env.GROUP_HISTORY_MAX_PAGES || '20', 10));
 let pendingGroupHistoryTotal = 0;
 let pendingDmHistoryTotal = 0;
+let senderReconciliationPromise = null;
+let recoveredHistoryProcessingPromise = null;
 
 
 export function setSocketIO(io) {
@@ -401,6 +412,139 @@ function scheduleOracleQuotationCheck(message, group) {
   oracleSyncTimers.set(group.id, timer);
   emitLog(`Supplier reply captured. Waiting ${quietSeconds} seconds for any quotation fragments or corrections.`);
   return true;
+}
+
+function activeSocketAccountId() {
+  return sock?.user?.id ? jidNormalizedUser(sock.user.id) : null;
+}
+
+function reconcileStoredSenderIdentity(lid, phoneJid, accountId = activeSocketAccountId()) {
+  const canonicalPhone = canonicalPhoneJid(phoneJid);
+  const canonicalLid = String(lid || '').trim();
+  if (!canonicalLid.endsWith('@lid') || !canonicalPhone || !accountId) return 0;
+
+  const changed = db.transaction(() => {
+    const messages = db.prepare(`
+      UPDATE messages
+      SET sender_id = ?
+      WHERE sender_id = ? AND account_id = ?
+    `).run(canonicalPhone, canonicalLid, accountId).changes;
+    const supplierCases = db.prepare(`
+      UPDATE oracle_quote_cases
+      SET supplier_sender_id = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE supplier_sender_id = ? AND account_id = ?
+    `).run(canonicalPhone, canonicalLid, accountId).changes;
+    const requesterCases = db.prepare(`
+      UPDATE oracle_quote_cases
+      SET requester_sender_id = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE requester_sender_id = ? AND account_id = ?
+    `).run(canonicalPhone, canonicalLid, accountId).changes;
+    return messages + supplierCases + requesterCases;
+  })();
+
+  if (changed > 0) {
+    ingestionState.reconciledSenderRows += changed;
+    emitLog(`Reconciled ${changed} stored sender record${changed === 1 ? '' : 's'} to a supplier-compatible WhatsApp phone identity.`);
+  }
+  return changed;
+}
+
+async function reconcileStoredLidSenders() {
+  if (senderReconciliationPromise) return senderReconciliationPromise;
+  const scheduledSocket = sock;
+  const accountId = activeSocketAccountId();
+  if (!scheduledSocket?.signalRepository?.lidMapping || !accountId) return 0;
+
+  senderReconciliationPromise = (async () => {
+    const rows = db.prepare(`
+      SELECT DISTINCT sender_id
+      FROM messages
+      WHERE account_id = ? AND sender_id LIKE '%@lid'
+    `).all(accountId);
+    let reconciled = 0;
+    for (const row of rows) {
+      if (sock !== scheduledSocket) break;
+      try {
+        const phoneJid = await scheduledSocket.signalRepository.lidMapping.getPNForLID(row.sender_id);
+        if (!phoneJid) {
+          ingestionState.senderMappingsUnresolved++;
+          continue;
+        }
+        ingestionState.senderMappingsResolved++;
+        reconciled += reconcileStoredSenderIdentity(row.sender_id, phoneJid, accountId);
+      } catch (error) {
+        ingestionState.senderMappingsUnresolved++;
+        emitLog(`Could not resolve a stored WhatsApp sender identity: ${error.message}`);
+      }
+    }
+    return reconciled;
+  })().finally(() => {
+    senderReconciliationPromise = null;
+    broadcastState();
+  });
+  return senderReconciliationPromise;
+}
+
+async function processUnparsedRecoveredSupplierHistory() {
+  if (recoveredHistoryProcessingPromise) return recoveredHistoryProcessingPromise;
+  const accountId = activeSocketAccountId();
+  if (!accountId) return 0;
+
+  recoveredHistoryProcessingPromise = (async () => {
+    const messages = db.prepare(`
+      SELECT m.*
+      FROM messages m
+      JOIN groups g ON g.id = m.group_id
+      WHERE m.account_id = ?
+        AND m.chat_type = 'group'
+        AND m.source = 'history'
+        AND g.is_monitored = 1
+        AND g.oracle_sync_enabled = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM oracle_quote_runs r WHERE r.trigger_message_id = m.id
+        )
+      ORDER BY m.timestamp ASC, m.id ASC
+      LIMIT 200
+    `).all(accountId);
+    const groups = new Map();
+    let processed = 0;
+
+    for (const message of messages) {
+      let group = groups.get(message.group_id);
+      if (!group) {
+        group = db.prepare('SELECT * FROM groups WHERE id = ?').get(message.group_id);
+        if (group) groups.set(message.group_id, group);
+      }
+      if (!group || !isConfiguredSupplierMessage(message, group)) continue;
+
+      try {
+        const result = await processOracleGroupMessage({
+          message,
+          group,
+          allowAutoPublish: false
+        });
+        emitOracleResult(result);
+        processed++;
+        ingestionState.recoveredHistoryQuotationChecks++;
+      } catch (error) {
+        emitLog(`Recovered quotation check could not complete for message #${message.id}: ${error.message}`);
+      }
+    }
+
+    if (processed > 0) {
+      emitLog(`Checked ${processed} recovered supplier message${processed === 1 ? '' : 's'} against the quotation-case pipeline; Oracle publishing remains review-gated.`);
+    }
+    return processed;
+  })().finally(() => {
+    recoveredHistoryProcessingPromise = null;
+    broadcastState();
+  });
+  return recoveredHistoryProcessingPromise;
+}
+
+async function maintainRecoveredSupplierHistory() {
+  await reconcileStoredLidSenders();
+  return processUnparsedRecoveredSupplierHistory();
 }
 
 export async function requestPairingCode(phoneNumber) {
@@ -723,6 +867,7 @@ async function initializeWhatsAppClient() {
         // Let the socket settle before the group IQ query. Baileys can close a
         // newly opened socket with status 428 when this query is sent too early.
         scheduleInitialGroupSync();
+        void maintainRecoveredSupplierHistory();
       }
 
       if (connection === 'close') {
@@ -782,6 +927,11 @@ async function initializeWhatsAppClient() {
       broadcastState();
     });
 
+    sock.ev.on('lid-mapping.update', ({ lid, pn }) => {
+      reconcileStoredSenderIdentity(lid, pn);
+      void processUnparsedRecoveredSupplierHistory();
+    });
+
     // Full history is delivered separately from live messages. Keep a bounded,
     // in-memory buffer for paused chats so the user can opt in before message
     // bodies are written to disk. Enabling a chat imports its buffered history.
@@ -800,6 +950,13 @@ async function initializeWhatsAppClient() {
       const discoveredGroupIds = new Set();
       let discoveredDms = 0;
       const historyGroups = new Set();
+      const accountId = activeSocketAccountId();
+      const latestStoredByGroup = new Map(db.prepare(`
+        SELECT group_id, MAX(timestamp) AS latest_timestamp
+        FROM messages
+        WHERE chat_type = 'group' AND (? IS NULL OR account_id = ?)
+        GROUP BY group_id
+      `).all(accountId, accountId).map(row => [row.group_id, row.latest_timestamp]));
 
       for (const contact of contacts) rememberContact(contact);
 
@@ -833,15 +990,16 @@ async function initializeWhatsAppClient() {
         }
 
         if (chatRecord?.is_monitored === 1) {
-          const recoveredDelivery = peerDataRequestSessionId
-            ? { source: 'catchup', activeDelivery: true }
-            : { source: 'history', activeDelivery: false };
+          const recoveredDelivery = classifyHistoryMessage(msg, {
+            peerDataRequestSessionId,
+            latestStoredTimestamp: chatType === 'group' ? latestStoredByGroup.get(remoteJid) : null
+          });
           const result = await handleIncomingMessage(msg, {
             source: recoveredDelivery.source,
             downloadMedia: recoveredDelivery.activeDelivery,
             runExtraction: recoveredDelivery.activeDelivery
           });
-          if (peerDataRequestSessionId) recordIngestionResult(msg, recoveredDelivery, result);
+          if (recoveredDelivery.activeDelivery) recordIngestionResult(msg, recoveredDelivery, result);
           if (result?.saved) {
             if (chatType === 'group') importedGroups++;
             else importedDms++;
@@ -860,6 +1018,7 @@ async function initializeWhatsAppClient() {
       if (discoveredDms > 0) emitDmUpdates();
       emitLog(`${peerDataRequestSessionId ? 'On-demand recovery' : 'History sync'} chunk received${progress != null ? ` (${progress}% complete)` : ''}: ${importedGroups} group + ${importedDms} DM messages imported; ${bufferedGroups} group + ${bufferedDms} DM messages held in memory pending selection${isLatest ? ' (latest sync)' : ''}.`);
       broadcastState();
+      void maintainRecoveredSupplierHistory();
 
       for (const [groupId, requestedAnchorId] of [...requestedGroupHistory.entries()]) {
         const currentAnchorId = groupHistoryAnchors.get(groupId)?.key?.id;
@@ -1122,7 +1281,27 @@ async function handleIncomingMessage(msg, options = {}) {
 
     const chatId = chatType === 'group' ? remoteJid : chatRecord.id;
     const chatName = chatRecord.name || remoteJid.split('@')[0];
-    const senderId = senderIdFromMessage(msg, sock?.user?.id || 'self');
+    const preliminarySenderId = senderIdFromMessage(msg, sock?.user?.id || 'self');
+    let senderId = preliminarySenderId;
+    if (preliminarySenderId.endsWith('@lid')) {
+      try {
+        const lidMapping = sock?.signalRepository?.lidMapping;
+        senderId = await resolvedSenderIdFromMessage(
+          msg,
+          sock?.user?.id || 'self',
+          lidMapping ? lid => lidMapping.getPNForLID(lid) : null
+        );
+        if (senderId !== preliminarySenderId) {
+          ingestionState.senderMappingsResolved++;
+          reconcileStoredSenderIdentity(preliminarySenderId, senderId);
+        } else {
+          ingestionState.senderMappingsUnresolved++;
+        }
+      } catch (error) {
+        ingestionState.senderMappingsUnresolved++;
+        emitLog(`Could not resolve the WhatsApp sender identity for message ${messageId || '<no id>'}: ${error.message}`);
+      }
+    }
     const senderName = msg.key?.fromMe
       ? (sock?.user?.name || 'You')
       : (msg.pushName || chatRecord.name || senderId.split('@')[0]);

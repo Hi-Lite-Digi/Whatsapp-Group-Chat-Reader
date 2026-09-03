@@ -38,6 +38,24 @@ export function classifyUpsertMessage(type, message, options = {}) {
   return { source: 'history', activeDelivery: false };
 }
 
+export function classifyHistoryMessage(message, options = {}) {
+  if (options.peerDataRequestSessionId) {
+    return { source: 'catchup', activeDelivery: true };
+  }
+
+  const timestampMs = messageTimestampMs(message);
+  const latestStoredMs = Date.parse(options.latestStoredTimestamp || '');
+  if (
+    timestampMs != null
+    && Number.isFinite(latestStoredMs)
+    && timestampMs > latestStoredMs
+  ) {
+    return { source: 'catchup', activeDelivery: true };
+  }
+
+  return { source: 'history', activeDelivery: false };
+}
+
 export function isActiveDeliverySource(source) {
   return source === 'realtime' || source === 'catchup';
 }
