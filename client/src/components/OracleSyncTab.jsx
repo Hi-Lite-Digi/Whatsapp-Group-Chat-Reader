@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle,
   Database,
+  Eye,
   Link2,
   LoaderCircle,
   MessageSquare,
@@ -11,6 +12,7 @@ import {
   ShieldCheck,
   Smartphone
 } from 'lucide-react';
+import CaseEvidencePanel from './CaseEvidencePanel.jsx';
 
 function statusBadge(status) {
   if (status === 'published') return 'badge badge-success';
@@ -80,6 +82,11 @@ export default function OracleSyncTab({
 }) {
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState('');
+  const [selectedCaseId, setSelectedCaseId] = useState(null);
+  const [caseAudit, setCaseAudit] = useState(null);
+  const [caseAuditLoading, setCaseAuditLoading] = useState(false);
+  const [caseAuditError, setCaseAuditError] = useState('');
+  const caseAuditRequestId = useRef(0);
   const connected = connState.status === 'connected';
   const mappedGroups = groups.filter(group => group.oracle_sync_enabled === 1);
   const autoPublish = settings.oracle_auto_publish === 'true';
@@ -116,6 +123,31 @@ export default function OracleSyncTab({
       () => onSaveSettings({ ...settings, oracle_auto_publish: autoPublish ? 'false' : 'true' }),
       autoPublish ? 'Automatic publishing is off.' : 'Automatic publishing is on.'
     );
+  };
+
+  const loadCaseAudit = async caseId => {
+    const requestId = ++caseAuditRequestId.current;
+    setSelectedCaseId(caseId);
+    setCaseAudit(current => current?.case?.id === caseId ? current : null);
+    setCaseAuditLoading(true);
+    setCaseAuditError('');
+    try {
+      const response = await fetch(`/api/oracle/cases/${caseId}/audit`, { cache: 'no-store' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Unable to load the quotation evidence');
+      if (requestId === caseAuditRequestId.current) setCaseAudit(data);
+    } catch (error) {
+      if (requestId === caseAuditRequestId.current) setCaseAuditError(error.message);
+    } finally {
+      if (requestId === caseAuditRequestId.current) setCaseAuditLoading(false);
+    }
+  };
+
+  const closeCaseAudit = () => {
+    caseAuditRequestId.current++;
+    setSelectedCaseId(null);
+    setCaseAudit(null);
+    setCaseAuditError('');
   };
 
   return (
@@ -208,14 +240,14 @@ export default function OracleSyncTab({
             <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '980px' }}>
               <thead>
                 <tr style={{ color: 'var(--text-dim)', fontSize: '0.72rem', textTransform: 'uppercase', textAlign: 'left' }}>
-                  {['Updated', 'Case', 'Supplier / Group', 'Known Evidence', 'Missing', 'Messages', 'Status'].map(label => <th key={label} style={{ padding: '13px 16px', borderBottom: '1px solid var(--border-color)' }}>{label}</th>)}
+                  {['Updated', 'Case', 'Supplier / Group', 'Known Evidence', 'Missing', 'Messages', 'Status', 'Evidence'].map(label => <th key={label} style={{ padding: '13px 16px', borderBottom: '1px solid var(--border-color)' }}>{label}</th>)}
                 </tr>
               </thead>
               <tbody>
                 {oracleCases.slice(0, 50).map(caseItem => {
                   const missing = parsedJson(caseItem.missing_fields_json, []);
                   return (
-                    <tr key={caseItem.id} style={{ borderBottom: '1px solid var(--border-color)', verticalAlign: 'top' }}>
+                    <tr key={caseItem.id} style={{ borderBottom: '1px solid var(--border-color)', verticalAlign: 'top', background: selectedCaseId === caseItem.id ? 'rgba(6, 182, 212, 0.06)' : 'transparent' }}>
                       <td style={{ padding: '13px 16px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{new Date(`${caseItem.updated_at}Z`).toLocaleString()}</td>
                       <td style={{ padding: '13px 16px', fontWeight: 700 }}>Q-{String(caseItem.id).padStart(4, '0')}</td>
                       <td style={{ padding: '13px 16px' }}><strong>{caseItem.supplier_code}</strong><div style={{ color: 'var(--text-dim)', fontSize: '0.78rem', marginTop: '4px' }}>{caseItem.group_name || caseItem.group_id}</div></td>
@@ -223,12 +255,22 @@ export default function OracleSyncTab({
                       <td style={{ padding: '13px 16px', color: missing.length ? '#fbbf24' : '#4ade80' }}>{missing.length ? missing.join(', ') : 'Complete'}</td>
                       <td style={{ padding: '13px 16px' }}>{caseItem.message_count || 0}</td>
                       <td style={{ padding: '13px 16px' }}><span className={statusBadge(caseItem.status)}>{caseItem.status}</span>{caseItem.last_reason && <div style={{ color: 'var(--text-dim)', fontSize: '0.72rem', marginTop: '5px' }}>{caseItem.last_reason}</div>}</td>
+                      <td style={{ padding: '13px 16px' }}><button className="btn btn-secondary" style={{ padding: '8px 11px', whiteSpace: 'nowrap' }} onClick={() => loadCaseAudit(caseItem.id)} disabled={caseAuditLoading && selectedCaseId === caseItem.id}><Eye size={14} /> View evidence</button></td>
                     </tr>
                   );
                 })}
               </tbody>
             </table>
           </div>
+        )}
+        {caseAuditError && selectedCaseId && <div style={{ padding: '15px 20px', borderTop: '1px solid var(--border-color)', color: '#f87171' }}>{caseAuditError}</div>}
+        {selectedCaseId && !caseAuditError && (
+          <CaseEvidencePanel
+            audit={caseAudit}
+            loading={caseAuditLoading}
+            onClose={closeCaseAudit}
+            onRefresh={() => loadCaseAudit(selectedCaseId)}
+          />
         )}
       </section>
 

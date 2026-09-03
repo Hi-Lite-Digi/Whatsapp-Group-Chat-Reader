@@ -813,13 +813,27 @@ export function getOracleQuoteCaseMessages(caseId) {
   if (!activeAccount) return [];
   return db.prepare(`
     SELECT m.id, m.wa_message_id, m.group_id, m.sender_id, m.sender_name,
-      m.content, m.extracted_text, m.reply_to_wa_message_id, m.timestamp,
+      m.message_type, m.content, m.extracted_text, m.media_path, m.media_mime,
+      m.source, m.reply_to_wa_message_id, m.timestamp,
       cm.role, cm.correlation_score, cm.match_reasons_json
     FROM oracle_quote_case_messages cm
     INNER JOIN oracle_quote_cases c ON c.id = cm.case_id AND c.account_id = ?
     INNER JOIN messages m ON m.id = cm.message_id AND m.account_id = c.account_id
     WHERE cm.case_id = ?
     ORDER BY m.timestamp ASC, m.id ASC
+  `).all(activeAccount, caseId);
+}
+
+export function getOracleQuoteRunsForCase(caseId) {
+  const activeAccount = getActiveWhatsappAccount();
+  if (!activeAccount) return [];
+  return db.prepare(`
+    SELECT r.*, g.name AS group_name
+    FROM oracle_quote_runs r
+    LEFT JOIN groups g ON g.id = r.group_id
+    INNER JOIN messages m ON m.id = r.trigger_message_id AND m.account_id = ?
+    WHERE r.case_id = ?
+    ORDER BY r.created_at ASC, r.id ASC
   `).all(activeAccount, caseId);
 }
 

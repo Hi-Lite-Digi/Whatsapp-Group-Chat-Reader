@@ -21,8 +21,11 @@ import {
   getSettings,
   updateSettings,
   getOracleQuoteCaseById,
+  getOracleQuoteCaseMessages,
   getOracleQuoteCases,
+  getOracleQuoteRunsForCase,
   getOracleQuoteRuns,
+  getOracleSyncEventsForCase,
   getOracleSyncEvents,
   getActiveWhatsappAccount,
   saveMessage,
@@ -556,6 +559,35 @@ app.get('/api/oracle/runs', (req, res) => {
 
 app.get('/api/oracle/cases', (req, res) => {
   res.json(getOracleQuoteCases(req.query.limit));
+});
+
+app.get('/api/oracle/cases/:id/audit', (req, res) => {
+  const caseId = Number(req.params.id);
+  if (!Number.isInteger(caseId) || caseId <= 0) {
+    return res.status(400).json({ error: 'A valid quotation case ID is required.' });
+  }
+  const caseItem = getOracleQuoteCaseById(caseId);
+  if (!caseItem) return res.status(404).json({ error: 'Quotation case not found.' });
+
+  const runs = getOracleQuoteRunsForCase(caseId);
+  const triggerRunIdsByMessage = new Map();
+  for (const run of runs) {
+    const runIds = triggerRunIdsByMessage.get(run.trigger_message_id) || [];
+    runIds.push(run.id);
+    triggerRunIdsByMessage.set(run.trigger_message_id, runIds);
+  }
+  const messages = getOracleQuoteCaseMessages(caseId).map(message => ({
+    ...message,
+    triggered_run_ids: triggerRunIdsByMessage.get(message.id) || []
+  }));
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    case: caseItem,
+    messages,
+    runs,
+    events: getOracleSyncEventsForCase(caseId)
+  });
 });
 
 app.post('/api/oracle/syncs/:id/publish', async (req, res) => {

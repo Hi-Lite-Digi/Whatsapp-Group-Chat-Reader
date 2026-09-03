@@ -79,8 +79,21 @@ export default function App() {
 
     // Initial REST fetches
     fetchInitialData();
+    const oracleRefreshTimer = window.setInterval(async () => {
+      try {
+        const [events, runs, cases] = await Promise.all([
+          fetch('/api/oracle/syncs?limit=100', { cache: 'no-store' }).then(response => response.json()),
+          fetch('/api/oracle/runs?limit=100', { cache: 'no-store' }).then(response => response.json()),
+          fetch('/api/oracle/cases?limit=100', { cache: 'no-store' }).then(response => response.json())
+        ]);
+        setOracleEvents(events);
+        setOracleRuns(runs);
+        setOracleCases(cases);
+      } catch {}
+    }, 10000);
 
     return () => {
+      window.clearInterval(oracleRefreshTimer);
       socket.off('connection_status');
       socket.off('groups_updated');
       socket.off('dms_updated');

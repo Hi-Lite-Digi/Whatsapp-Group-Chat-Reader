@@ -153,6 +153,24 @@ test('re-opens an incomplete case when a related fragment arrives outside the qu
     });
     assert.equal(persistentSession.eligible, true);
     assert.deepEqual(persistentSession.messages.map(message => message.id), [requestId, priceId, modelId, stockId]);
+
+    const auditMessages = database.getOracleQuoteCaseMessages(thirdResolution.caseRecord.id);
+    assert.equal(auditMessages.length, 4);
+    assert.equal(auditMessages[0].message_type, 'conversation');
+    assert.equal(auditMessages[0].source, 'realtime');
+    assert.equal(auditMessages[1].role, 'supplier');
+
+    const auditRun = database.createOracleQuoteRun({
+      group_id: group.id,
+      trigger_message_id: stockId,
+      status: 'completed',
+      source_message_ids: auditMessages.map(message => message.id),
+      event_count: 0,
+      case_id: thirdResolution.caseRecord.id
+    });
+    const auditRuns = database.getOracleQuoteRunsForCase(thirdResolution.caseRecord.id);
+    assert.deepEqual(auditRuns.map(run => run.id), [auditRun.id]);
+    assert.equal(auditRuns[0].trigger_message_id, stockId);
   } finally {
     database.db.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
