@@ -123,7 +123,7 @@ function fieldEvidence(value) {
 function fieldMappings(knownFields, events) {
   const mappings = Array.isArray(knownFields.field_mappings) ? knownFields.field_mappings : [];
   if (mappings.length > 0) {
-    return mappings.map(mapping => ({
+    const normalized = mappings.map(mapping => ({
       brand: mapping.brand || undefined,
       model: mapping.model || undefined,
       size: mapping.size || undefined,
@@ -139,6 +139,19 @@ function fieldMappings(knownFields, events) {
         Object.entries(mapping.evidence || {}).map(([field, evidence]) => [field, fieldEvidence(evidence)])
       )
     }));
+    const uniqueMappings = new Map();
+    for (const mapping of normalized) {
+      const key = [
+        mapping.brand,
+        mapping.model,
+        mapping.size,
+        mapping.price,
+        mapping.stockQuantity,
+        mapping.availability
+      ].map(value => String(value || '').trim().toLowerCase()).join('|');
+      uniqueMappings.set(key, mapping);
+    }
+    return [...uniqueMappings.values()];
   }
 
   return events.map(event => ({

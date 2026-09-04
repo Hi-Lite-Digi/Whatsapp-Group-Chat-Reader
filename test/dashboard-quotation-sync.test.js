@@ -99,6 +99,21 @@ test('builds a traceable idempotent dashboard quotation payload and durable outb
               explanation: 'Price and a positive quantity were stated together.'
             }
           }
+        }, {
+          brand: 'Continental',
+          model: 'Sport Contact 7',
+          size: '255/40/19',
+          price: 240,
+          stock_quantity: 4,
+          availability: 'ready_stock',
+          confidence: 0.91,
+          evidence: {
+            price: {
+              message_ids: [supplierMessageId],
+              basis: 'explicit',
+              explanation: 'Supplier stated $240.'
+            }
+          }
         }]
       },
       missing_fields_json: [],
@@ -149,6 +164,7 @@ test('builds a traceable idempotent dashboard quotation payload and durable outb
     assert.equal(payload.groupName, 'MRR X TYRES ONLINE');
     assert.equal(payload.requiresStaffVerification, true);
     assert.equal(payload.events[0].stockQuantity, 4);
+    assert.equal(payload.fieldMappings.length, 1);
     assert.deepEqual(payload.fieldMappings[0].evidence.price.messageIds, [supplierMessageId]);
     assert.equal(payload.contextMessages[0].includedInCase, true);
     assert.equal(payload.contextMessages.length, 2);
