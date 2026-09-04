@@ -50,6 +50,19 @@ test('builds a traceable idempotent dashboard quotation payload and durable outb
       account_id: 'listener@s.whatsapp.net',
       timestamp: '2026-09-01T10:02:00.000Z'
     });
+    database.saveMessage({
+      wa_message_id: 'sender-key-event',
+      group_id: 'quotes@g.us',
+      group_name: 'MRR X TYRES ONLINE',
+      sender_id: 'listener@s.whatsapp.net',
+      sender_name: 'MRR Staff',
+      message_type: 'senderKeyDistributionMessage',
+      content: '[senderKeyDistributionMessage]',
+      source: 'realtime',
+      chat_type: 'group',
+      account_id: 'listener@s.whatsapp.net',
+      timestamp: '2026-09-01T10:01:00.000Z'
+    });
     const caseRecord = database.createOracleQuoteCase({
       account_id: 'listener@s.whatsapp.net',
       group_id: 'quotes@g.us',
@@ -138,6 +151,10 @@ test('builds a traceable idempotent dashboard quotation payload and durable outb
     assert.equal(payload.events[0].stockQuantity, 4);
     assert.deepEqual(payload.fieldMappings[0].evidence.price.messageIds, [supplierMessageId]);
     assert.equal(payload.contextMessages[0].includedInCase, true);
+    assert.equal(payload.contextMessages.length, 2);
+    assert.ok(payload.contextMessages.every(message => message.messageType === 'conversation'));
+    assert.ok(payload.messages.every(message => message.messageType === 'conversation'));
+    assert.ok(payload.contextMessages.every(message => !message.body.includes('senderKeyDistributionMessage')));
     assert.match(payload.sourceRevision, /^[a-f0-9]{64}$/);
 
     dashboardSync.queueDashboardQuotationCase(caseRecord.id);

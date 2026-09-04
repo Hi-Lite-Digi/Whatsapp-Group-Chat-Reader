@@ -15,6 +15,7 @@ import {
   queueDashboardQuoteSync
 } from '../db/database.js';
 import { quotationCaseLifetimeMinutes } from './cases.js';
+import { isConversationalMessageType } from '../whatsapp/message-types.js';
 
 const SYNC_INTERVAL_MS = Math.max(
   10_000,
@@ -87,6 +88,7 @@ function normalizedMessage(message, includedMessageIds, supplierIds) {
   return {
     id: Number(message.id),
     whatsappMessageId: message.wa_message_id || undefined,
+    messageType: message.message_type || undefined,
     role,
     senderName: message.sender_name || message.sender_id || 'Unknown sender',
     body: messageBody(message),
@@ -94,9 +96,7 @@ function normalizedMessage(message, includedMessageIds, supplierIds) {
     includedInCase,
     exclusionReason: includedInCase
       ? undefined
-      : message.message_type === 'senderKeyDistributionMessage'
-        ? 'WhatsApp encryption protocol event; not conversational content.'
-        : 'Nearby message was not attached by the quotation correlation rules.',
+      : 'Nearby message was not attached by the quotation correlation rules.',
     matchReasons: Array.isArray(matchReasons) ? matchReasons.map(String) : []
   };
 }
@@ -184,6 +184,7 @@ function sourceRevision(payload) {
     sourceMessageIds: payload.sourceMessageIds,
     fieldMappings: payload.fieldMappings,
     messages: payload.messages,
+    contextMessages: payload.contextMessages,
     events: payload.events
   })).digest('hex');
 }
@@ -195,11 +196,13 @@ export function buildDashboardQuotationPayload(caseId) {
   const knownFields = parseJson(caseRecord.known_fields_json, {});
   const missingFields = parseJson(caseRecord.missing_fields_json, []);
   const sourceMessageIds = parseJson(caseRecord.source_message_ids, []);
-  const messages = getOracleQuoteCaseMessages(caseRecord.id);
+  const messages = getOracleQuoteCaseMessages(caseRecord.id)
+    .filter(message => isConversationalMessageType(message.message_type));
   const includedMessageIds = new Set(messages.map(message => message.id));
   const supplierIds = supplierSenderIds(caseRecord);
   const contextWindowMinutes = quotationCaseLifetimeMinutes(getSettings());
-  const context = getOracleQuoteCaseContextMessages(caseRecord.id, contextWindowMinutes);
+  const context = getOracleQuoteCaseContextMessages(caseRecord.id, contextWindowMinutes)
+    .filter(message => isConversationalMessageType(message.message_type));
   const events = getOracleSyncEventsForCase(caseRecord.id).map(normalizedEvent);
   const normalizedMessages = messages.map(message => normalizedMessage(message, includedMessageIds, supplierIds));
   const normalizedContext = context.map(message => normalizedMessage(message, includedMessageIds, supplierIds));

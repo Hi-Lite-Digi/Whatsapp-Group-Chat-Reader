@@ -43,6 +43,7 @@ import {
 } from '../oracle/dashboard-sync.js';
 import { getDisconnectPolicy } from './disconnect-policy.js';
 import { groupJidFrom, groupNameFrom } from './group-discovery.js';
+import { isNonConversationalMessageType } from './message-types.js';
 import {
   canonicalPhoneJid,
   resolvedSenderIdFromMessage,
@@ -1324,6 +1325,9 @@ async function handleIncomingMessage(msg, options = {}) {
     // Determine message type & text content
     const messageType = Object.keys(normalizedMessage)[0];
     if (!messageType) return { saved: false, reason: 'missing_message_type' };
+    if (isNonConversationalMessageType(messageType)) {
+      return { saved: false, reason: 'non_conversational_message_type' };
+    }
     const replyToWaMessageId = normalizedMessage?.[messageType]?.contextInfo?.stanzaId || null;
     let content = '';
     let mediaObj = null;
