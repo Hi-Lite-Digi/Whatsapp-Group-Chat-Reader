@@ -42,7 +42,8 @@ function reasonLabel(reason) {
     invalid_supplier_mapping: 'The configured supplier could not be verified against Oracle.',
     duplicate_quotes: 'The same quotation candidate had already been recorded.',
     llm_failure: 'The quotation extraction service could not complete the check.',
-    pipeline_error: 'The quotation pipeline encountered an internal processing error.'
+    pipeline_error: 'The quotation pipeline encountered an internal processing error.',
+    assumed_availability_needs_review: 'Ready-stock availability was assumed from the supplier price and quantity. MRR staff verification is required before publishing.'
   }[reason] || reason || 'No blocking reason was recorded.';
 }
 
@@ -52,7 +53,7 @@ const FIELD_DEFINITIONS = [
   { key: 'sizes', missingKey: 'size', label: 'Tyre size', requirement: 'A valid tyre size such as 295/30R21' },
   { key: 'prices', missingKey: 'price', label: 'Per-piece price', requirement: 'A positive supplier quote price per tyre' },
   { key: 'quantities', missingKey: 'quantity', label: 'Stock quantity', requirement: 'A positive quantity explicitly confirmed by the supplier' },
-  { key: 'availabilities', missingKey: 'confirmed_availability', label: 'Availability', requirement: 'An explicit ready-stock confirmation from the supplier' }
+  { key: 'availabilities', missingKey: 'confirmed_availability', label: 'Availability', requirement: 'Explicit ready stock, or a priced supplier quantity pending MRR staff verification' }
 ];
 
 function fieldValues(definition, fields) {
@@ -60,7 +61,10 @@ function fieldValues(definition, fields) {
   if (definition.key === 'prices') return values.map(value => `S$${Number(value).toFixed(2)}`);
   if (definition.key === 'quantities') return values.map(value => `${value} pc${Number(value) === 1 ? '' : 's'}`);
   if (definition.key === 'availabilities') {
-    return values.map(value => value === 'ready_stock' ? 'Ready stock confirmed' : String(value).replaceAll('_', ' '));
+    const assumed = (fields.availability_evidence || []).includes('price_quantity_assumption');
+    return values.map(value => value === 'ready_stock'
+      ? assumed ? 'Ready stock assumed — verify' : 'Ready stock confirmed'
+      : String(value).replaceAll('_', ' '));
   }
   return values;
 }
@@ -78,6 +82,9 @@ export default function CaseEvidencePanel({ audit, loading, onClose, onRefresh }
   const missingFields = parsedJson(caseItem?.missing_fields_json, []);
   const complete = missingFields.length === 0;
   const blocked = !complete || !['ready', 'published'].includes(caseItem?.status);
+  const assumedAvailability = (knownFields.availability_evidence || []).includes('price_quantity_assumption');
+  const requiresVerification = assumedAvailability && caseItem?.status !== 'published';
+  const needsAttention = blocked || requiresVerification;
 
   return (
     <div style={{ borderTop: '1px solid var(--border-color)', background: 'rgba(4, 10, 20, 0.58)', padding: '22px' }}>
@@ -99,14 +106,18 @@ export default function CaseEvidencePanel({ audit, loading, onClose, onRefresh }
         <div style={{ padding: '34px 0', color: 'var(--text-muted)', display: 'flex', gap: '10px', alignItems: 'center' }}><RefreshCw size={18} className="spin" /> Loading the exact source messages and decisions…</div>
       ) : (
         <>
-          <div style={{ marginTop: '18px', padding: '16px', borderRadius: '13px', border: `1px solid ${blocked ? 'rgba(245, 158, 11, 0.35)' : 'rgba(37, 211, 102, 0.35)'}`, background: blocked ? 'rgba(245, 158, 11, 0.09)' : 'rgba(37, 211, 102, 0.09)', display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
-            {blocked ? <XCircle size={21} color="#fbbf24" style={{ flex: '0 0 auto' }} /> : <CheckCircle2 size={21} color="#4ade80" style={{ flex: '0 0 auto' }} />}
+          <div style={{ marginTop: '18px', padding: '16px', borderRadius: '13px', border: `1px solid ${needsAttention ? 'rgba(245, 158, 11, 0.35)' : 'rgba(37, 211, 102, 0.35)'}`, background: needsAttention ? 'rgba(245, 158, 11, 0.09)' : 'rgba(37, 211, 102, 0.09)', display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+            {needsAttention ? <XCircle size={21} color="#fbbf24" style={{ flex: '0 0 auto' }} /> : <CheckCircle2 size={21} color="#4ade80" style={{ flex: '0 0 auto' }} />}
             <div>
-              <strong style={{ color: blocked ? '#fbbf24' : '#4ade80' }}>{blocked ? 'Not fulfilled — no Oracle create/update was sent' : 'All required quotation evidence is present'}</strong>
+              <strong style={{ color: needsAttention ? '#fbbf24' : '#4ade80' }}>{blocked
+                ? 'Not fulfilled — no Oracle create/update was sent'
+                : requiresVerification ? 'Prepared for MRR staff verification' : 'All required quotation evidence is present'}</strong>
               <div style={{ color: 'var(--text-muted)', marginTop: '5px', lineHeight: 1.55 }}>
                 {blocked
                   ? `${reasonLabel(caseItem.last_reason)}${missingFields.length ? ` Missing: ${missingFields.join(', ')}.` : ''}`
-                  : 'This case has passed the six-field readiness gate.'}
+                  : requiresVerification
+                    ? 'The supplier provided a price and quantity, so ready-stock availability was assumed. Verify the source messages below before publishing to Oracle.'
+                    : 'This case has passed the six-field readiness gate.'}
               </div>
             </div>
           </div>

@@ -22,6 +22,8 @@ import {
   buildQuotationSession,
   canonicalBrand,
   canonicalModel,
+  extractAvailabilityEvidence,
+  extractStockQuantities,
   formatQuotationContext,
   normalizeTyreSize,
   quotationItemHasEvidence,
@@ -49,16 +51,16 @@ export const QUOTE_SCHEMA = {
   instruction_prompt: `Extract only definite NEW-TYRE supplier quotations from this bounded WhatsApp quotation session.
 Each line labels the sender as SUPPLIER or REQUESTER. Only supplier replies can create quotation items.
 Messages may be informal, abbreviated, multilingual, or split across a short back-and-forth. Combine nearby fragments when the current supplier message completes or corrects the quotation.
-Set current_message_completes_quotation to true only when every item has an evidenced brand, model, tyre size, per-piece price, positive supplier stock quantity, and explicit ready-stock confirmation. A preorder or unknown availability is not Oracle-ready.
-Return definite candidate items with current_message_completes_quotation false when the product and price are evidenced but quantity or ready-stock confirmation is still missing. Return an empty items array when stock is unavailable, the discussion is only a request/question, or the product is a battery, rim, service, delivery arrangement, or anything other than a new tyre.
-Never infer a price, brand, model, tyre size, quantity, or availability that was not supplied. A bare price can be joined only to the active tyre request in the same short conversation.
+Set current_message_completes_quotation to true only when every item has an evidenced brand, model, tyre size, per-piece price, and positive supplier stock quantity. Explicit ready-stock wording is preferred. Under the MRR review rule, a supplier-provided price plus a positive supplier quantity for the same item may be treated as ready_stock for a staff-verifiable draft. A preorder or unknown availability is not Oracle-ready.
+Return definite candidate items with current_message_completes_quotation false when the product and price are evidenced but quantity is still missing. Return an empty items array when stock is unavailable, the discussion is only a request/question, or the product is a battery, rim, service, delivery arrangement, or anything other than a new tyre.
+Never infer a price, brand, model, tyre size, or quantity that was not supplied. Availability may be assumed only under the MRR price-plus-quantity review rule above. A bare price can be joined only to the active tyre request in the same short conversation.
 Handle multiple tyre-size sections in one supplier message. Associate each model and price with the closest preceding size heading.
 Normalize passenger sizes to WIDTH/PROFILE/RIM, for example 225/45/17. Preserve commercial formats such as 195R15C.
 Treat Y25 and dot25 as 2025, and Y26 and dot26 as 2026.
 Price must be the supplier's per-piece quoted price. A quantity such as 2pcs describes availability, not a multiplier.
 An alternative offered after saying the requested model is unavailable is a valid quotation for the alternative only.
-Set stock_quantity only when a supplier explicitly states a quantity such as "left 1pc" or "4pcs". Otherwise return null.
-Set availability to ready_stock only for explicit supplier confirmation such as "ready stock", "in stock", "available now", or "left 2pcs". Use preorder for an explicit preorder and unknown otherwise.
+Set stock_quantity only when a supplier states a quantity such as "left 1pc", "4pcs", or "only 4". Otherwise return null.
+Set availability to ready_stock for explicit supplier confirmation such as "ready stock", "in stock", "available now", or "left 2pcs". Also set it to ready_stock when the same bounded supplier evidence contains both the quoted price and a positive supplier quantity for the item; MRR staff will verify that assumption from the source transcript before publishing. Use preorder for an explicit preorder and unknown otherwise.
 Set match_type to exact when the item answers the requested model, alternative when offered instead of an unavailable request, or unsolicited for a supplier stock broadcast without a requester anchor.
 The current message is marked [CURRENT]. Prefer corrections and confirmations in the newest messages over older context.
 Confidence must be between 0 and 1. Missing quantity or availability should remain null/unknown rather than being invented; lower confidence only when an extracted value is ambiguous.`,
@@ -463,7 +465,22 @@ export async function processOracleGroupMessage({ message, group, allowAutoPubli
     }
     const rawItems = Array.isArray(extraction.extractedData?.items) ? extraction.extractedData.items : [];
     const fallbackDate = message.timestamp || new Date().toISOString();
-    const normalizedItems = rawItems.map(item => normalizeQuoteItem(item, fallbackDate)).filter(Boolean);
+    const supplierQuantities = extractStockQuantities(session.evidence.supplierText);
+    const sessionAvailability = extractAvailabilityEvidence(session.evidence.supplierText);
+    const normalizedItems = rawItems.map(item => normalizeQuoteItem(item, fallbackDate)).filter(Boolean)
+      .map(item => {
+        const stockQuantity = item.stock_quantity == null
+          && rawItems.length === 1
+          && supplierQuantities.length === 1
+          ? supplierQuantities[0]
+          : item.stock_quantity;
+        const availability = item.availability === 'unknown'
+          && stockQuantity
+          && sessionAvailability.availabilities.includes('ready_stock')
+          ? 'ready_stock'
+          : item.availability;
+        return { ...item, stock_quantity: stockQuantity, availability };
+      });
     const items = [];
     const itemKeys = new Set();
     for (const item of normalizedItems) {
@@ -492,11 +509,8 @@ export async function processOracleGroupMessage({ message, group, allowAutoPubli
     }
     const missingByItem = items.map(item => missingOracleReadyFields(item));
     const missingFields = [...new Set(missingByItem.flat())];
-    if (
-      extraction.extractedData?.current_message_completes_quotation !== true
-      || missingFields.length > 0
-    ) {
-    const reason = missingFields.length > 0 ? 'missing_required_fields' : 'incomplete_or_irrelevant';
+    if (missingFields.length > 0) {
+    const reason = 'missing_required_fields';
     const updatedRun = updateOracleQuoteRun(run.id, {
       status: 'skipped',
       reason,

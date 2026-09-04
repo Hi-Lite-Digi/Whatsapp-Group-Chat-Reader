@@ -1,4 +1,8 @@
-import { extractQuotationSignals, normalizeComparable } from './quotation.js';
+import {
+  extractAvailabilityEvidence,
+  extractQuotationSignals,
+  normalizeComparable
+} from './quotation.js';
 
 export const REQUIRED_QUOTATION_FIELDS = Object.freeze([
   'brand',
@@ -53,22 +57,32 @@ export function mergeQuotationSignals(...signals) {
     years: unique(signals.flatMap(item => item?.years || []), value => String(value)),
     quantities: unique(signals.flatMap(item => item?.quantities || []), value => String(value)),
     availabilities: unique(signals.flatMap(item => item?.availabilities || []), normalizeComparable),
+    availability_evidence: unique(signals.flatMap(item => item?.availability_evidence || []), normalizeComparable),
     looksLikeRequest: signals.some(item => item?.looksLikeRequest === true),
     meaningfulContinuation: signals.some(item => item?.meaningfulContinuation === true)
   };
 }
 
 export function signalsForMessages(messages, supplierSenderIds = null) {
-  return mergeQuotationSignals(...(messages || []).map(message => {
+  const eligibleSupplierMessages = [];
+  const merged = mergeQuotationSignals(...(messages || []).map(message => {
     const signals = extractQuotationSignals(messageText(message));
     const supplierRoleKnown = message?.role != null || supplierSenderIds instanceof Set;
     const isSupplier = message?.role === 'supplier'
       || supplierSenderIds instanceof Set && supplierSenderIds.has(message?.sender_id);
     if (supplierRoleKnown && !isSupplier) {
-      return { ...signals, quantities: [], availabilities: [] };
+      return { ...signals, quantities: [], availabilities: [], availability_evidence: [] };
     }
+    eligibleSupplierMessages.push(message);
     return signals;
   }));
+  const combinedSupplierEvidence = extractAvailabilityEvidence(
+    eligibleSupplierMessages.map(messageText).join('\n')
+  );
+  return mergeQuotationSignals(merged, {
+    availabilities: combinedSupplierEvidence.availabilities,
+    availability_evidence: combinedSupplierEvidence.evidence
+  });
 }
 
 export function missingQuotationFields(signals) {

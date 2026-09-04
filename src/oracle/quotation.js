@@ -131,7 +131,9 @@ export function extractStockQuantities(value) {
   const patterns = [
     /\b(\d{1,3})\s*(?:pcs?|pieces?|units?)\b/gi,
     /\b(?:qty|quantity)\s*[:=x-]?\s*(\d{1,3})\b/gi,
-    /\b(?:left|stock)\s*[:=x-]?\s*(\d{1,3})\b/gi
+    /\b(?:left|stock)\s*[:=x-]?\s*(\d{1,3})\b/gi,
+    /\bonly\s+(\d{1,3})(?:\s*(?:pcs?|pieces?|units?))?\b/gi,
+    /\b(\d{1,3})(?:\s*(?:pcs?|pieces?|units?))?\s+only\b/gi
   ];
   for (const pattern of patterns) {
     for (const match of text.matchAll(pattern)) {
@@ -142,12 +144,29 @@ export function extractStockQuantities(value) {
   return quantities;
 }
 
-export function extractConfirmedAvailabilities(value) {
+export function extractAvailabilityEvidence(value) {
   const text = String(value || '');
   const availabilities = [];
-  if (!NEGATIVE_PATTERN.test(text) && READY_STOCK_PATTERN.test(text)) availabilities.push('ready_stock');
-  if (PREORDER_PATTERN.test(text)) availabilities.push('preorder');
-  return availabilities;
+  const evidence = [];
+  const negative = NEGATIVE_PATTERN.test(text);
+  const preorder = PREORDER_PATTERN.test(text);
+  if (preorder) {
+    availabilities.push('preorder');
+    evidence.push('explicit_preorder');
+  } else if (!negative && READY_STOCK_PATTERN.test(text)) {
+    availabilities.push('ready_stock');
+    evidence.push('explicit_supplier_confirmation');
+  } else if (!negative && hasSupplierPrice(text) && extractStockQuantities(text).length > 0) {
+    // MRR business rule: a supplier-provided price plus a positive stock count
+    // is sufficient to prepare a ready-stock draft for staff verification.
+    availabilities.push('ready_stock');
+    evidence.push('price_quantity_assumption');
+  }
+  return { availabilities, evidence };
+}
+
+export function extractConfirmedAvailabilities(value) {
+  return extractAvailabilityEvidence(value).availabilities;
 }
 
 function normalizedPhrasePresent(value, phrase) {
@@ -178,6 +197,7 @@ export function extractQuotationSignals(value) {
   const text = String(value || '');
   const models = extractKnownModels(text);
   const brands = extractKnownBrands(text);
+  const availability = extractAvailabilityEvidence(text);
   for (const model of models) {
     const inferredBrand = MODEL_BRANDS.get(model);
     if (inferredBrand && !brands.includes(inferredBrand)) brands.push(inferredBrand);
@@ -193,7 +213,8 @@ export function extractQuotationSignals(value) {
     models,
     years,
     quantities: extractStockQuantities(text),
-    availabilities: extractConfirmedAvailabilities(text),
+    availabilities: availability.availabilities,
+    availability_evidence: availability.evidence,
     looksLikeRequest: looksLikeTyreRequest(text),
     meaningfulContinuation: isMeaningfulContinuation(text)
   };

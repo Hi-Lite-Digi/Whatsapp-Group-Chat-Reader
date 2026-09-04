@@ -65,6 +65,17 @@ test('keeps preorder availability incomplete for the Oracle-ready gate', () => {
   assert.deepEqual(missingQuotationFields(signals), ['confirmed_availability']);
 });
 
+test('combines a supplier price and quantity fragment into a reviewable stock assumption', () => {
+  const signals = signalsForMessages([
+    { role: 'supplier', content: '255/40/19 Continental Sport Contact 7 $240 dot25' },
+    { role: 'supplier', content: 'Only 4' }
+  ]);
+  assert.deepEqual(signals.quantities, [4]);
+  assert.deepEqual(signals.availabilities, ['ready_stock']);
+  assert.deepEqual(signals.availability_evidence, ['price_quantity_assumption']);
+  assert.deepEqual(missingQuotationFields(signals), []);
+});
+
 test('matches a late fragment that fills the only open case after the quiet period', () => {
   const result = chooseQuotationCase({
     cases: [baseCase],

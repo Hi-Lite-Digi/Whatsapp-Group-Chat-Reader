@@ -212,7 +212,8 @@ function signalsForQuoteItems(items) {
     models: [...new Set((items || []).map(item => item.model).filter(Boolean))],
     years: [...new Set((items || []).map(item => item.year_of_manufacture).filter(Boolean))],
     quantities: [...new Set((items || []).map(item => item.stock_quantity).filter(Boolean))],
-    availabilities: [...new Set((items || []).map(item => item.availability).filter(value => value === 'ready_stock'))]
+    availabilities: [...new Set((items || []).map(item => item.availability).filter(value => value === 'ready_stock'))],
+    availability_evidence: []
   };
 }
 
@@ -261,6 +262,7 @@ export function markQuotationCaseReady(caseId, event, items, sourceMessageIds) {
   } catch {}
   const knownFields = mergeQuotationSignals(previousFields, itemFields);
   const missingFields = [...new Set(items.flatMap(missingOracleReadyFields))];
+  const assumedAvailability = knownFields.availability_evidence?.includes('price_quantity_assumption');
   return updateOracleQuoteCase(caseId, {
     status: missingFields.length > 0
       ? 'incomplete'
@@ -269,7 +271,11 @@ export function markQuotationCaseReady(caseId, event, items, sourceMessageIds) {
     missing_fields_json: missingFields,
     source_message_ids: sourceMessageIds,
     current_event_id: event?.id || null,
-    last_reason: missingFields.length > 0 ? 'missing_required_fields' : null,
+    last_reason: event?.sync_status === 'published'
+      ? null
+      : missingFields.length > 0
+        ? 'missing_required_fields'
+        : assumedAvailability ? 'assumed_availability_needs_review' : null,
     completed_at: event?.sync_status === 'published' ? new Date().toISOString() : null
   });
 }

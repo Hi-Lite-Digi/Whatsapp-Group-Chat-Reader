@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   buildQuotationSession,
   canonicalModel,
+  extractAvailabilityEvidence,
   extractConfirmedAvailabilities,
   extractStockQuantities,
   extractTyreSizes,
@@ -63,6 +64,19 @@ test('extracts only explicit supplier quantity and confirmed availability eviden
   assert.deepEqual(extractConfirmedAvailabilities('pre-order, 5 day lead time'), ['preorder']);
   assert.deepEqual(extractConfirmedAvailabilities('not available'), []);
   assert.deepEqual(extractConfirmedAvailabilities('$140 dot26'), []);
+});
+
+test('prepares price plus supplier quantity as an assumed ready-stock draft', () => {
+  assert.deepEqual(extractStockQuantities('Only 4'), [4]);
+  assert.deepEqual(extractStockQuantities('4 only'), [4]);
+  assert.deepEqual(extractAvailabilityEvidence('Continental SC7 $240, only 4'), {
+    availabilities: ['ready_stock'],
+    evidence: ['price_quantity_assumption']
+  });
+  assert.deepEqual(extractAvailabilityEvidence('Continental SC7 $240, 4pcs preorder'), {
+    availabilities: ['preorder'],
+    evidence: ['explicit_preorder']
+  });
 });
 
 test('requires extracted quantity and availability claims to be present in supplier evidence', () => {

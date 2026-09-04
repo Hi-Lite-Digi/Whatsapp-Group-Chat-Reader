@@ -173,6 +173,29 @@ test('re-opens an incomplete case when a related fragment arrives outside the qu
     const auditRuns = database.getOracleQuoteRunsForCase(thirdResolution.caseRecord.id);
     assert.deepEqual(auditRuns.map(run => run.id), [auditRun.id]);
     assert.equal(auditRuns[0].trigger_message_id, stockId);
+
+    const assumedCase = database.createOracleQuoteCase({
+      account_id: 'listener@s.whatsapp.net',
+      group_id: group.id,
+      supplier_code: 'TO',
+      status: 'collecting',
+      known_fields_json: {
+        sizes: ['255/40/19'], brands: ['Continental'], models: ['sport contact 7'],
+        prices: [240], quantities: [4], availabilities: ['ready_stock'],
+        availability_evidence: ['price_quantity_assumption']
+      },
+      missing_fields_json: [],
+      opened_at: '2026-08-25T03:00:00.000Z',
+      last_activity_at: '2026-08-25T03:00:00.000Z',
+      expires_at: '2026-08-25T04:00:00.000Z'
+    });
+    const reviewCase = cases.markQuotationCaseReady(assumedCase.id, { sync_status: 'ready' }, [{
+      brand: 'Continental', model: 'Sport Contact 7', size: '255/40/19', price: 240,
+      stock_quantity: 4, availability: 'ready_stock'
+    }], ['supplier-quote', 'supplier-quantity']);
+    assert.equal(reviewCase.status, 'ready');
+    assert.equal(reviewCase.last_reason, 'assumed_availability_needs_review');
+    assert.deepEqual(JSON.parse(reviewCase.missing_fields_json), []);
   } finally {
     database.db.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
