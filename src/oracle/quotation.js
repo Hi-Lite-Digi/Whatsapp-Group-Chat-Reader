@@ -344,7 +344,7 @@ export function formatQuotationContext(session, supplierSenderIds) {
     const role = supplierSenderIds.has(message.sender_id) ? 'SUPPLIER' : 'REQUESTER';
     const marker = message.id === session.current.id ? ' [CURRENT]' : '';
     const text = [message.content, message.extracted_text].filter(Boolean).join('\n');
-    return `${message.timestamp}${marker} [${role}] ${message.sender_name || message.sender_id}: ${text}`;
+    return `[MESSAGE_ID:${message.id}] ${message.timestamp}${marker} [${role}] ${message.sender_name || message.sender_id}: ${text}`;
   }).join('\n');
 }
 

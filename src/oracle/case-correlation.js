@@ -58,6 +58,9 @@ export function mergeQuotationSignals(...signals) {
     quantities: unique(signals.flatMap(item => item?.quantities || []), value => String(value)),
     availabilities: unique(signals.flatMap(item => item?.availabilities || []), normalizeComparable),
     availability_evidence: unique(signals.flatMap(item => item?.availability_evidence || []), normalizeComparable),
+    field_mappings: signals.flatMap(item => item?.field_mappings || []),
+    requires_staff_verification: signals.some(item => item?.requires_staff_verification === true),
+    interpretation_methods: unique(signals.flatMap(item => item?.interpretation_methods || []), normalizeComparable),
     looksLikeRequest: signals.some(item => item?.looksLikeRequest === true),
     meaningfulContinuation: signals.some(item => item?.meaningfulContinuation === true)
   };

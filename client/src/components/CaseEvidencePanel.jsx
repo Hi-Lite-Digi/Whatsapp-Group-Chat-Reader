@@ -43,7 +43,8 @@ function reasonLabel(reason) {
     duplicate_quotes: 'The same quotation candidate had already been recorded.',
     llm_failure: 'The quotation extraction service could not complete the check.',
     pipeline_error: 'The quotation pipeline encountered an internal processing error.',
-    assumed_availability_needs_review: 'Ready-stock availability was assumed from the supplier price and quantity. MRR staff verification is required before publishing.'
+    assumed_availability_needs_review: 'Ready-stock availability was assumed from the supplier price and quantity. MRR staff verification is required before publishing.',
+    llm_interpretation_needs_review: 'One or more quotation fields were interpreted contextually by the LLM. MRR staff verification is required before publishing.'
   }[reason] || reason || 'No blocking reason was recorded.';
 }
 
@@ -74,6 +75,20 @@ function runReason(run) {
   return reasonLabel(run.reason);
 }
 
+const MAPPING_LABELS = {
+  brand: 'Brand',
+  model: 'Model',
+  size: 'Tyre size',
+  price: 'Price',
+  quantity: 'Quantity',
+  availability: 'Availability'
+};
+
+function mappingValue(mapping, field) {
+  if (field === 'quantity') return mapping.stock_quantity;
+  return mapping[field];
+}
+
 export default function CaseEvidencePanel({ audit, loading, onClose, onRefresh }) {
   const caseItem = audit?.case;
   if (!caseItem && !loading) return null;
@@ -83,8 +98,10 @@ export default function CaseEvidencePanel({ audit, loading, onClose, onRefresh }
   const complete = missingFields.length === 0;
   const blocked = !complete || !['ready', 'published'].includes(caseItem?.status);
   const assumedAvailability = (knownFields.availability_evidence || []).includes('price_quantity_assumption');
-  const requiresVerification = assumedAvailability && caseItem?.status !== 'published';
+  const llmReviewRequired = knownFields.requires_staff_verification === true;
+  const requiresVerification = (assumedAvailability || llmReviewRequired) && caseItem?.status !== 'published';
   const needsAttention = blocked || requiresVerification;
+  const fieldMappings = knownFields.field_mappings || [];
 
   return (
     <div style={{ borderTop: '1px solid var(--border-color)', background: 'rgba(4, 10, 20, 0.58)', padding: '22px' }}>
@@ -116,7 +133,9 @@ export default function CaseEvidencePanel({ audit, loading, onClose, onRefresh }
                 {blocked
                   ? `${reasonLabel(caseItem.last_reason)}${missingFields.length ? ` Missing: ${missingFields.join(', ')}.` : ''}`
                   : requiresVerification
-                    ? 'The supplier provided a price and quantity, so ready-stock availability was assumed. Verify the source messages below before publishing to Oracle.'
+                    ? assumedAvailability
+                      ? 'The supplier provided a price and quantity, so ready-stock availability was assumed. Verify the LLM mapping and source messages below before publishing to Oracle.'
+                      : 'The LLM interpreted one or more fields using conversational context or learned supplier patterns. Verify the mapping and source messages below before publishing to Oracle.'
                     : 'This case has passed the six-field readiness gate.'}
               </div>
             </div>
@@ -140,6 +159,35 @@ export default function CaseEvidencePanel({ audit, loading, onClose, onRefresh }
               })}
             </div>
           </div>
+
+          {fieldMappings.length > 0 && (
+            <div style={{ marginTop: '24px' }}>
+              <h4 style={{ display: 'flex', gap: '8px', alignItems: 'center', fontSize: '0.95rem' }}><FileSearch size={18} color="var(--accent-amber)" /> LLM field mapping</h4>
+              <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '5px', lineHeight: 1.5 }}>The LLM’s value, interpretation basis, source message IDs, and explanation for each field. Historical examples guide language interpretation only; current values must point to this case’s messages.</p>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '13px' }}>
+                {fieldMappings.map((mapping, mappingIndex) => (
+                  <div key={`${mapping.brand || 'quote'}-${mappingIndex}`} style={{ padding: '14px', borderRadius: '12px', border: '1px solid var(--border-color)', background: 'rgba(255,255,255,0.025)' }}>
+                    <strong>{mapping.brand} {mapping.model}</strong>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '9px', marginTop: '11px' }}>
+                      {Object.entries(MAPPING_LABELS).map(([field, label]) => {
+                        const evidence = mapping.evidence?.[field] || {};
+                        const value = mappingValue(mapping, field);
+                        return (
+                          <div key={field} style={{ padding: '10px', borderRadius: '9px', background: 'rgba(255,255,255,0.035)' }}>
+                            <div style={{ color: 'var(--text-dim)', fontSize: '0.7rem', textTransform: 'uppercase' }}>{label}</div>
+                            <div style={{ marginTop: '4px', fontWeight: 600 }}>{value == null || value === '' ? 'Not mapped' : String(value)}</div>
+                            <div style={{ marginTop: '5px', color: evidence.basis === 'explicit' ? '#4ade80' : '#fbbf24', fontSize: '0.72rem' }}>{String(evidence.basis || 'contextual').replaceAll('_', ' ')}</div>
+                            <div style={{ marginTop: '4px', color: 'var(--text-muted)', fontSize: '0.72rem', lineHeight: 1.4 }}>{evidence.explanation || 'No explanation supplied.'}</div>
+                            <div style={{ marginTop: '4px', color: 'var(--text-dim)', fontSize: '0.68rem' }}>Messages: {(evidence.message_ids || []).map(id => `#${id}`).join(', ') || 'case transcript'}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div style={{ marginTop: '24px' }}>
             <h4 style={{ display: 'flex', gap: '8px', alignItems: 'center', fontSize: '0.95rem' }}><MessageSquareText size={18} color="#25d366" /> Exact case transcript</h4>

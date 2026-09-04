@@ -37,6 +37,10 @@ import {
   publishOracleSyncEvent,
   processOracleGroupMessage
 } from '../oracle/sync.js';
+import {
+  flushDashboardQuotationSyncs,
+  queueDashboardQuotationCase
+} from '../oracle/dashboard-sync.js';
 import { getDisconnectPolicy } from './disconnect-policy.js';
 import { groupJidFrom, groupNameFrom } from './group-discovery.js';
 import {
@@ -335,6 +339,12 @@ function scheduleInitialGroupSync() {
 function emitOracleResult(oracleResult) {
   if (oracleResult?.case && ioInstance) {
     ioInstance.emit('oracle_case_result', oracleResult.case);
+  }
+  if (oracleResult?.case?.id) {
+    queueDashboardQuotationCase(oracleResult.case.id);
+    void flushDashboardQuotationSyncs().catch(error => {
+      emitLog(`Mrrjestic dashboard quotation delivery will retry: ${error.message}`);
+    });
   }
   if (oracleResult?.run && ioInstance) {
     ioInstance.emit('oracle_run_result', oracleResult.run);

@@ -31,7 +31,7 @@ function parsedJson(value, fallback) {
 function knownCaseSummary(caseItem) {
   const fields = parsedJson(caseItem.known_fields_json, {});
   const availabilityAssumed = (fields.availability_evidence || []).includes('price_quantity_assumption');
-  return [
+  const values = [
     ...(fields.sizes || []),
     ...(fields.brands || []),
     ...(fields.models || []),
@@ -40,12 +40,19 @@ function knownCaseSummary(caseItem) {
     ...(fields.availabilities || []).map(value => value === 'ready_stock'
       ? availabilityAssumed ? 'Ready stock assumed — verify' : 'Ready stock confirmed'
       : value)
-  ].join(' · ') || 'Evidence collecting';
+  ];
+  if (fields.requires_staff_verification === true) values.push('LLM-mapped — verify');
+  return values.join(' · ') || 'Evidence collecting';
 }
 
 function caseAvailabilityAssumed(caseItem) {
   const fields = parsedJson(caseItem?.known_fields_json, {});
   return (fields.availability_evidence || []).includes('price_quantity_assumption');
+}
+
+function caseRequiresStaffVerification(caseItem) {
+  const fields = parsedJson(caseItem?.known_fields_json, {});
+  return fields.requires_staff_verification === true || caseAvailabilityAssumed(caseItem);
 }
 
 function listingLabel(status) {
@@ -286,7 +293,7 @@ export default function OracleSyncTab({
         <div style={{ padding: '20px', borderBottom: '1px solid var(--border-color)', display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' }}>
           <div>
             <h3 style={{ fontSize: '1rem' }}>Quotation Review Queue</h3>
-            <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '4px' }}>A supplier price plus quantity can prepare a ready-stock assumption, but MRR staff must verify the attached messages before publishing it to Oracle.</p>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginTop: '4px' }}>The LLM maps conversational fields using the supplier’s historical patterns. Contextual interpretations and price-plus-quantity availability assumptions remain traceable to messages and require MRR staff verification.</p>
           </div>
           <span className="badge badge-info">{oracleEvents.length} records</span>
         </div>
@@ -307,6 +314,9 @@ export default function OracleSyncTab({
                   const assumedAvailability = caseAvailabilityAssumed(
                     oracleCases.find(caseItem => caseItem.id === event.case_id)
                   );
+                  const requiresStaffVerification = caseRequiresStaffVerification(
+                    oracleCases.find(caseItem => caseItem.id === event.case_id)
+                  );
                   return <tr key={event.id} style={{ borderBottom: '1px solid var(--border-color)', verticalAlign: 'top' }}>
                     <td style={{ padding: '15px 16px', color: 'var(--text-muted)', fontSize: '0.8rem', whiteSpace: 'nowrap' }}>{new Date(`${event.created_at}Z`).toLocaleString()}</td>
                     <td style={{ padding: '15px 16px' }}><strong>{event.supplier_name || event.supplier_code}</strong><div style={{ color: 'var(--text-dim)', fontSize: '0.78rem', marginTop: '4px' }}>{event.group_name}{event.case_id ? ` · Q-${String(event.case_id).padStart(4, '0')}` : ''}</div></td>
@@ -323,7 +333,7 @@ export default function OracleSyncTab({
                     <td style={{ padding: '15px 16px' }}>
                       {(event.sync_status === 'ready' || event.sync_status === 'failed') && missingEventFields(event).length === 0 && (
                         <button className="btn btn-primary" onClick={() => run(`publish-${event.id}`, () => onPublishEvent(event.id), 'Quotation published to Oracle.')} disabled={busy === `publish-${event.id}`}>
-                          <Send size={14} /> {assumedAvailability ? 'Verify & publish' : 'Publish'}
+                          <Send size={14} /> {requiresStaffVerification ? 'Verify & publish' : 'Publish'}
                         </button>
                       )}
                       {missingEventFields(event).length > 0 && <div style={{ color: '#fbbf24', fontSize: '0.75rem', maxWidth: '180px' }}>Waiting for {missingEventFields(event).join(', ')}</div>}

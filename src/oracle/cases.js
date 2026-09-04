@@ -213,7 +213,19 @@ function signalsForQuoteItems(items) {
     years: [...new Set((items || []).map(item => item.year_of_manufacture).filter(Boolean))],
     quantities: [...new Set((items || []).map(item => item.stock_quantity).filter(Boolean))],
     availabilities: [...new Set((items || []).map(item => item.availability).filter(value => value === 'ready_stock'))],
-    availability_evidence: []
+    availability_evidence: [],
+    field_mappings: (items || []).map(item => ({
+      brand: item.brand,
+      model: item.model,
+      size: item.size,
+      price: item.price,
+      stock_quantity: item.stock_quantity,
+      availability: item.availability,
+      confidence: item.confidence,
+      evidence: item.field_evidence || {}
+    })),
+    requires_staff_verification: (items || []).some(item => item.requires_staff_verification === true),
+    interpretation_methods: ['llm']
   };
 }
 
@@ -263,6 +275,7 @@ export function markQuotationCaseReady(caseId, event, items, sourceMessageIds) {
   const knownFields = mergeQuotationSignals(previousFields, itemFields);
   const missingFields = [...new Set(items.flatMap(missingOracleReadyFields))];
   const assumedAvailability = knownFields.availability_evidence?.includes('price_quantity_assumption');
+  const llmReviewRequired = knownFields.requires_staff_verification === true;
   return updateOracleQuoteCase(caseId, {
     status: missingFields.length > 0
       ? 'incomplete'
@@ -275,7 +288,9 @@ export function markQuotationCaseReady(caseId, event, items, sourceMessageIds) {
       ? null
       : missingFields.length > 0
         ? 'missing_required_fields'
-        : assumedAvailability ? 'assumed_availability_needs_review' : null,
+        : llmReviewRequired
+          ? 'llm_interpretation_needs_review'
+          : assumedAvailability ? 'assumed_availability_needs_review' : null,
     completed_at: event?.sync_status === 'published' ? new Date().toISOString() : null
   });
 }

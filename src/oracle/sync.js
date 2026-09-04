@@ -26,7 +26,6 @@ import {
   extractStockQuantities,
   formatQuotationContext,
   normalizeTyreSize,
-  quotationItemHasEvidence,
   sourceMessageIds
 } from './quotation.js';
 import {
@@ -50,10 +49,10 @@ export const QUOTE_SCHEMA = {
   name: 'Oracle Supplier Tyre Quotations',
   instruction_prompt: `Extract only definite NEW-TYRE supplier quotations from this bounded WhatsApp quotation session.
 Each line labels the sender as SUPPLIER or REQUESTER. Only supplier replies can create quotation items.
-Messages may be informal, abbreviated, multilingual, or split across a short back-and-forth. Combine nearby fragments when the current supplier message completes or corrects the quotation.
+Messages may be informal, abbreviated, multilingual, or split across a short back-and-forth. Combine nearby fragments when the current supplier message completes or corrects the quotation. Interpret field meaning with the help of the supplied historical conversation-style examples, including the supplier's habitual shorthand and response patterns.
 Set current_message_completes_quotation to true only when every item has an evidenced brand, model, tyre size, per-piece price, and positive supplier stock quantity. Explicit ready-stock wording is preferred. Under the MRR review rule, a supplier-provided price plus a positive supplier quantity for the same item may be treated as ready_stock for a staff-verifiable draft. A preorder or unknown availability is not Oracle-ready.
 Return definite candidate items with current_message_completes_quotation false when the product and price are evidenced but quantity is still missing. Return an empty items array when stock is unavailable, the discussion is only a request/question, or the product is a battery, rim, service, delivery arrangement, or anything other than a new tyre.
-Never infer a price, brand, model, tyre size, or quantity that was not supplied. Availability may be assumed only under the MRR price-plus-quantity review rule above. A bare price can be joined only to the active tyre request in the same short conversation.
+The CURRENT CASE TRANSCRIPT is the only source of quotation values. HISTORICAL STYLE EXAMPLES may guide the interpretation of shorthand but their product values must never be copied into the current quotation. Availability may be assumed under the MRR price-plus-quantity review rule above. A bare price can be joined only to the active tyre request in the same case conversation.
 Handle multiple tyre-size sections in one supplier message. Associate each model and price with the closest preceding size heading.
 Normalize passenger sizes to WIDTH/PROFILE/RIM, for example 225/45/17. Preserve commercial formats such as 195R15C.
 Treat Y25 and dot25 as 2025, and Y26 and dot26 as 2026.
@@ -79,7 +78,16 @@ Confidence must be between 0 and 1. Missing quantity or availability should rema
       availability: 'ready_stock | preorder | unknown',
       match_type: 'exact | alternative | unsolicited',
       quoted_at: 'YYYY-MM-DD or null',
-      confidence: 'number from 0 to 1'
+      confidence: 'number from 0 to 1',
+      requires_staff_verification: 'boolean; true when any field depends on context, supplier habit, shorthand, or an availability assumption',
+      field_evidence: {
+        brand: { message_ids: ['integer IDs from CURRENT CASE TRANSCRIPT'], basis: 'explicit | contextual | supplier_pattern_inference', explanation: 'short reason' },
+        model: { message_ids: ['integer IDs from CURRENT CASE TRANSCRIPT'], basis: 'explicit | contextual | supplier_pattern_inference', explanation: 'short reason' },
+        size: { message_ids: ['integer IDs from CURRENT CASE TRANSCRIPT'], basis: 'explicit | contextual | supplier_pattern_inference', explanation: 'short reason' },
+        price: { message_ids: ['integer IDs from CURRENT CASE TRANSCRIPT'], basis: 'explicit | contextual | supplier_pattern_inference', explanation: 'short reason' },
+        quantity: { message_ids: ['integer IDs from CURRENT CASE TRANSCRIPT'], basis: 'explicit | contextual | supplier_pattern_inference', explanation: 'short reason' },
+        availability: { message_ids: ['integer IDs from CURRENT CASE TRANSCRIPT'], basis: 'explicit | contextual | supplier_pattern_inference | price_quantity_assumption', explanation: 'short reason' }
+      }
     }],
     notes: 'string or null'
   }, null, 2)
@@ -141,7 +149,7 @@ function normalizeQuoteItem(item, fallbackDate) {
   const confidence = Number(item?.confidence);
 
   if (!brand || !model || !size || !Number.isFinite(price) || price <= 0) return null;
-  if (!Number.isFinite(confidence) || confidence < 0.85) return null;
+  if (!Number.isFinite(confidence) || confidence < 0.7) return null;
 
   const stockQuantity = Number(item?.stock_quantity);
   const availability = ['ready_stock', 'preorder', 'unknown'].includes(item?.availability)
@@ -163,8 +171,67 @@ function normalizeQuoteItem(item, fallbackDate) {
     availability,
     match_type: matchType,
     quoted_at: isoDate(item?.quoted_at, fallbackDate),
-    confidence: Math.min(confidence, 1)
+    confidence: Math.min(confidence, 1),
+    requires_staff_verification: item?.requires_staff_verification === true,
+    field_evidence: item?.field_evidence && typeof item.field_evidence === 'object'
+      ? item.field_evidence
+      : {}
   };
+}
+
+const MAPPED_FIELDS = Object.freeze(['brand', 'model', 'size', 'price', 'quantity', 'availability']);
+const EVIDENCE_BASES = new Set([
+  'explicit',
+  'contextual',
+  'supplier_pattern_inference',
+  'price_quantity_assumption'
+]);
+
+function withTraceableLlmMapping(item, session, { forceAvailabilityAssumption = false } = {}) {
+  const allowedMessageIds = new Set((session.messages || []).map(message => Number(message.id)));
+  const fallbackMessageIds = [...allowedMessageIds];
+  const evidence = {};
+  let requiresStaffVerification = item.requires_staff_verification === true;
+
+  for (const field of MAPPED_FIELDS) {
+    const source = item.field_evidence?.[field] || {};
+    const messageIds = [...new Set((Array.isArray(source.message_ids) ? source.message_ids : [])
+      .map(Number)
+      .filter(id => Number.isInteger(id) && allowedMessageIds.has(id)))];
+    let basis = EVIDENCE_BASES.has(source.basis) ? source.basis : 'contextual';
+    if (field === 'availability' && forceAvailabilityAssumption) basis = 'price_quantity_assumption';
+    if (basis !== 'explicit') requiresStaffVerification = true;
+    evidence[field] = {
+      message_ids: messageIds.length > 0 ? messageIds : fallbackMessageIds,
+      basis,
+      explanation: String(source.explanation || 'Mapped by the LLM from the attached case transcript.').slice(0, 500)
+    };
+  }
+
+  return {
+    ...item,
+    field_evidence: evidence,
+    requires_staff_verification: requiresStaffVerification
+  };
+}
+
+export function formatSupplierBehaviorContext({
+  messages,
+  supplierSenderIds,
+  excludedMessageIds = new Set(),
+  maxMessages = 30
+}) {
+  const examples = (messages || [])
+    .filter(message => !excludedMessageIds.has(message.id))
+    .filter(message => String(message.content || message.extracted_text || '').trim())
+    .filter(message => !String(message.content || '').includes('senderKeyDistributionMessage'))
+    .slice(-Math.max(1, Math.min(Number(maxMessages) || 30, 50)));
+  if (examples.length === 0) return 'No historical style examples were available.';
+  return examples.map(message => {
+    const role = supplierSenderIds.has(message.sender_id) ? 'SUPPLIER' : 'REQUESTER';
+    const text = [message.content, message.extracted_text].filter(Boolean).join('\n').slice(0, 800);
+    return `${message.timestamp} [${role}] ${message.sender_name || message.sender_id}: ${text}`;
+  }).join('\n');
 }
 
 function payloadHash(supplierCode, item) {
@@ -442,8 +509,21 @@ export async function processOracleGroupMessage({ message, group, allowAutoPubli
 
   try {
     const context = formatQuotationContext(session, supplierSenderIds);
+    const caseMessageIds = new Set(session.messages.map(item => item.id));
+    const behaviorContext = formatSupplierBehaviorContext({
+      messages: discoveryMessages,
+      supplierSenderIds,
+      excludedMessageIds: caseMessageIds,
+      maxMessages: 30
+    });
     const extraction = await processMessageWithLLM({
-    content: context,
+    content: `--- HISTORICAL STYLE EXAMPLES ---
+Use these only to understand sender roles, shorthand, and recurring conversation patterns. Do not copy any product value from this section into the current case.
+${behaviorContext}
+
+--- CURRENT CASE TRANSCRIPT ---
+Only messages in this section may provide quotation field values and field_evidence message_ids.
+${context}`,
     schema: QUOTE_SCHEMA,
     senderInfo: {
       name: message.sender_name,
@@ -479,12 +559,18 @@ export async function processOracleGroupMessage({ message, group, allowAutoPubli
           && sessionAvailability.availabilities.includes('ready_stock')
           ? 'ready_stock'
           : item.availability;
-        return { ...item, stock_quantity: stockQuantity, availability };
+        return withTraceableLlmMapping(
+          { ...item, stock_quantity: stockQuantity, availability },
+          session,
+          {
+            forceAvailabilityAssumption: availability === 'ready_stock'
+              && sessionAvailability.evidence.includes('price_quantity_assumption')
+          }
+        );
       });
     const items = [];
     const itemKeys = new Set();
     for (const item of normalizedItems) {
-      if (!quotationItemHasEvidence(item, session)) continue;
       const key = `${normalizeText(item.brand)}|${normalizeText(item.model)}|${item.size}|${item.price.toFixed(2)}`;
       if (!itemKeys.has(key)) {
         itemKeys.add(key);

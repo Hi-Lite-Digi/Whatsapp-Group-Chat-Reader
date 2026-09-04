@@ -189,6 +189,20 @@ export function initDatabase() {
       FOREIGN KEY (message_id) REFERENCES messages (id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS dashboard_quote_sync_outbox (
+      case_id INTEGER PRIMARY KEY,
+      source_revision TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      synced_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (case_id) REFERENCES oracle_quote_cases (id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_oracle_sync_events_created
       ON oracle_sync_events (created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_oracle_sync_events_group
@@ -201,6 +215,8 @@ export function initDatabase() {
       ON oracle_quote_cases (status, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_oracle_quote_case_messages_message
       ON oracle_quote_case_messages (message_id, case_id);
+    CREATE INDEX IF NOT EXISTS idx_dashboard_quote_sync_pending
+      ON dashboard_quote_sync_outbox (status, next_attempt_at);
   `);
 
   // Keep older local databases compatible with the source marker.
@@ -900,6 +916,69 @@ export function getOracleQuoteCases(limit = 100) {
     ORDER BY c.updated_at DESC, c.id DESC
     LIMIT ?
   `).all(activeAccount, safeLimit);
+}
+
+export function queueDashboardQuoteSync(caseId, sourceRevision, payload) {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO dashboard_quote_sync_outbox (
+      case_id, source_revision, payload_json, status, attempts,
+      next_attempt_at, last_error, synced_at, updated_at
+    ) VALUES (?, ?, ?, 'pending', 0, ?, NULL, NULL, CURRENT_TIMESTAMP)
+    ON CONFLICT(case_id) DO UPDATE SET
+      source_revision = excluded.source_revision,
+      payload_json = excluded.payload_json,
+      status = 'pending',
+      attempts = CASE
+        WHEN dashboard_quote_sync_outbox.source_revision = excluded.source_revision
+          THEN dashboard_quote_sync_outbox.attempts
+        ELSE 0
+      END,
+      next_attempt_at = excluded.next_attempt_at,
+      last_error = NULL,
+      synced_at = CASE
+        WHEN dashboard_quote_sync_outbox.source_revision = excluded.source_revision
+          THEN dashboard_quote_sync_outbox.synced_at
+        ELSE NULL
+      END,
+      updated_at = CURRENT_TIMESTAMP
+  `).run(caseId, sourceRevision, serializeJson(payload, {}), now);
+  return getDashboardQuoteSync(caseId);
+}
+
+export function getDashboardQuoteSync(caseId) {
+  return db.prepare('SELECT * FROM dashboard_quote_sync_outbox WHERE case_id = ?').get(caseId);
+}
+
+export function getPendingDashboardQuoteSyncs(limit = 20, atTimestamp = new Date().toISOString()) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 20, 100));
+  return db.prepare(`
+    SELECT * FROM dashboard_quote_sync_outbox
+    WHERE status = 'pending' AND next_attempt_at <= ?
+    ORDER BY next_attempt_at ASC, case_id ASC
+    LIMIT ?
+  `).all(atTimestamp, safeLimit);
+}
+
+export function markDashboardQuoteSyncSucceeded(caseId, sourceRevision) {
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE dashboard_quote_sync_outbox
+    SET status = 'synced', synced_at = ?, last_error = NULL,
+      next_attempt_at = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE case_id = ? AND source_revision = ?
+  `).run(now, now, caseId, sourceRevision);
+  return getDashboardQuoteSync(caseId);
+}
+
+export function markDashboardQuoteSyncFailed(caseId, sourceRevision, errorMessage, nextAttemptAt) {
+  db.prepare(`
+    UPDATE dashboard_quote_sync_outbox
+    SET status = 'pending', attempts = attempts + 1, last_error = ?,
+      next_attempt_at = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE case_id = ? AND source_revision = ?
+  `).run(String(errorMessage || 'Dashboard synchronization failed.').slice(0, 2000), nextAttemptAt, caseId, sourceRevision);
+  return getDashboardQuoteSync(caseId);
 }
 
 export function createOracleSyncEvent(event) {

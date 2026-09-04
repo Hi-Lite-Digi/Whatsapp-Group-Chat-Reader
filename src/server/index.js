@@ -56,6 +56,12 @@ import {
   pingOracle
 } from '../oracle/client.js';
 import { publishOracleSyncEvent } from '../oracle/sync.js';
+import {
+  dashboardQuotationSyncStatus,
+  queueDashboardQuotationCase,
+  startDashboardQuotationSyncWorker,
+  stopDashboardQuotationSyncWorker
+} from '../oracle/dashboard-sync.js';
 import { settingsForClient, settingsUpdateForStorage } from './settings-security.js';
 
 dotenv.config();
@@ -146,6 +152,10 @@ app.get('/monitor/oracle', async (req, res) => {
   } catch (error) {
     return res.status(502).json({ ok: false, status: 'down', message: error.message });
   }
+});
+
+app.get('/monitor/dashboard-sync', (req, res) => {
+  res.json({ ok: true, ...dashboardQuotationSyncStatus() });
 });
 
 app.get('/health/live', (req, res) => {
@@ -610,6 +620,7 @@ app.get('/api/oracle/cases/:id/audit', (req, res) => {
 app.post('/api/oracle/syncs/:id/publish', async (req, res) => {
   try {
     const event = await publishOracleSyncEvent(Number(req.params.id));
+    if (event?.case_id) queueDashboardQuotationCase(event.case_id);
     io.emit('oracle_sync_result', event);
     if (event?.case_id) io.emit('oracle_case_result', getOracleQuoteCaseById(event.case_id));
     res.json({ message: 'Quotation published to Oracle.', event });
@@ -679,6 +690,14 @@ server.listen(PORT, HOST, () => {
   
   // Start Baileys engine
   initWhatsAppClient();
+  startDashboardQuotationSyncWorker({
+    publishEvent: publishOracleSyncEvent,
+    onLog: message => console.log(`[DASHBOARD SYNC] ${message}`),
+    onPublished: event => {
+      io.emit('oracle_sync_result', event);
+      if (event?.case_id) io.emit('oracle_case_result', getOracleQuoteCaseById(event.case_id));
+    }
+  });
 });
 
 let shuttingDown = false;
@@ -694,6 +713,7 @@ async function gracefulShutdown(signal, exitCode = 0) {
   forcedExit.unref?.();
 
   try {
+    stopDashboardQuotationSyncWorker();
     await shutdownWhatsApp();
     await new Promise(resolve => io.close(() => server.close(resolve)));
     db.pragma('wal_checkpoint(TRUNCATE)');
