@@ -75,6 +75,12 @@ function runReason(run) {
   return reasonLabel(run.reason);
 }
 
+function quotationRoleLabel(message) {
+  if (message.quotation_role === 'quote_request') return 'Quote request';
+  if (message.quotation_role === 'supplier_quotation') return 'Supplier quotation';
+  return message.included_in_case ? 'Case evidence' : 'Context only';
+}
+
 const MAPPING_LABELS = {
   brand: 'Brand',
   model: 'Model',
@@ -201,7 +207,7 @@ export default function CaseEvidencePanel({ audit, loading, onClose, onRefresh }
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap', alignItems: 'center' }}>
                       <div style={{ display: 'flex', gap: '7px', alignItems: 'center', flexWrap: 'wrap' }}>
                         <strong>{message.sender_name || message.sender_id}</strong>
-                        <span className={supplier ? 'badge badge-success' : 'badge badge-info'}>{message.role || 'context'}</span>
+                        <span className={supplier ? 'badge badge-success' : 'badge badge-info'}>{quotationRoleLabel(message)}</span>
                         {triggered && <span className="badge badge-warning">Triggered check #{message.triggered_run_ids.join(', #')}</span>}
                       </div>
                       <span style={{ color: 'var(--text-dim)', fontSize: '0.74rem', display: 'flex', gap: '5px', alignItems: 'center' }}><Clock3 size={13} /> {localTime(message.timestamp)}</span>
@@ -225,7 +231,7 @@ export default function CaseEvidencePanel({ audit, loading, onClose, onRefresh }
               {(audit.context_messages || []).map(message => (
                 <div key={message.id} style={{ display: 'grid', gridTemplateColumns: 'minmax(125px, auto) minmax(120px, 180px) 1fr', gap: '12px', alignItems: 'start', padding: '11px 12px', borderRadius: '10px', background: message.included_in_case ? 'rgba(37, 211, 102, 0.07)' : 'rgba(255,255,255,0.025)', border: `1px solid ${message.included_in_case ? 'rgba(37, 211, 102, 0.19)' : 'var(--border-color)'}` }}>
                   <div style={{ color: 'var(--text-dim)', fontSize: '0.72rem', whiteSpace: 'nowrap' }}>{localTime(message.timestamp)}</div>
-                  <div style={{ minWidth: 0 }}><strong style={{ fontSize: '0.8rem' }}>{message.sender_name || message.sender_id}</strong><div style={{ marginTop: '5px' }}><span className={message.included_in_case ? 'badge badge-success' : 'badge badge-info'}>{message.included_in_case ? 'Used by case' : 'Context only'}</span></div></div>
+                  <div style={{ minWidth: 0 }}><strong style={{ fontSize: '0.8rem' }}>{message.sender_name || message.sender_id}</strong><div style={{ marginTop: '5px' }}><span className={message.included_in_case ? 'badge badge-success' : 'badge badge-info'}>{quotationRoleLabel(message)}</span></div></div>
                   <div style={{ minWidth: 0 }}>
                     <div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', lineHeight: 1.45, color: message.message_type === 'senderKeyDistributionMessage' ? 'var(--text-dim)' : 'var(--text-main)' }}>{message.content || `[${message.message_type || 'message'}]`}</div>
                     {message.exclusion_reason && <div style={{ color: 'var(--text-dim)', fontSize: '0.71rem', marginTop: '5px' }}>{message.exclusion_reason}</div>}

@@ -117,6 +117,7 @@ test('joins a fragmented model, price, and year exchange', () => {
   ]);
   assert.equal(session.eligible, true);
   assert.equal(session.messages.length, 6);
+  assert.deepEqual(session.evidence.supplierMessageIds, [2, 4, 6]);
   assert.equal(quotationItemHasEvidence({
     brand: 'Michelin', model: 'Pilot Sport 5', size: '225/45/18', price: 235
   }, session), true);

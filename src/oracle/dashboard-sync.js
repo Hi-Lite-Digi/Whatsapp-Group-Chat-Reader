@@ -90,6 +90,9 @@ function normalizedMessage(message, includedMessageIds, supplierIds) {
     whatsappMessageId: message.wa_message_id || undefined,
     messageType: message.message_type || undefined,
     role,
+    quotationRole: includedInCase
+      ? role === 'supplier' ? 'supplier_quotation' : 'quote_request'
+      : 'context',
     senderName: message.sender_name || message.sender_id || 'Unknown sender',
     body: messageBody(message),
     createdAt: toIso(message.timestamp),

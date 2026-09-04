@@ -50,7 +50,7 @@ export const QUOTE_SCHEMA = {
   instruction_prompt: `Extract only definite NEW-TYRE supplier quotations from this bounded WhatsApp quotation session.
 Each line labels the sender as SUPPLIER or REQUESTER. Only supplier replies can create quotation items.
 Messages may be informal, abbreviated, multilingual, or split across a short back-and-forth. Combine nearby fragments when the current supplier message completes or corrects the quotation. Interpret field meaning with the help of the supplied historical conversation-style examples, including the supplier's habitual shorthand and response patterns.
-Set current_message_completes_quotation to true only when every item has an evidenced brand, model, tyre size, per-piece price, and positive supplier stock quantity. Explicit ready-stock wording is preferred. Under the MRR review rule, a supplier-provided price plus a positive supplier quantity for the same item may be treated as ready_stock for a staff-verifiable draft. A preorder or unknown availability is not Oracle-ready.
+Set current_message_completes_quotation to true only when every item has an evidenced brand, model, tyre size, per-piece price, and positive supplier stock quantity. Explicit ready-stock wording is preferred. Under the MRR review rules, a supplier-provided price plus a positive supplier quantity for the same item may be treated as ready_stock. When brand, model, size, and price are all exact but the supplier omits quantity, prepare a staff-verifiable single-unit draft with stock_quantity 1 and ready_stock. Never apply that fallback to preorder or unavailable stock.
 Return definite candidate items with current_message_completes_quotation false when the product and price are evidenced but quantity is still missing. Return an empty items array when stock is unavailable, the discussion is only a request/question, or the product is a battery, rim, service, delivery arrangement, or anything other than a new tyre.
 The CURRENT CASE TRANSCRIPT is the only source of quotation values. HISTORICAL STYLE EXAMPLES may guide the interpretation of shorthand but their product values must never be copied into the current quotation. Availability may be assumed under the MRR price-plus-quantity review rule above. A bare price can be joined only to the active tyre request in the same case conversation.
 Handle multiple tyre-size sections in one supplier message. Associate each model and price with the closest preceding size heading.
@@ -62,7 +62,7 @@ Set stock_quantity only when a supplier states a quantity such as "left 1pc", "4
 Set availability to ready_stock for explicit supplier confirmation such as "ready stock", "in stock", "available now", or "left 2pcs". Also set it to ready_stock when the same bounded supplier evidence contains both the quoted price and a positive supplier quantity for the item; MRR staff will verify that assumption from the source transcript before publishing. Use preorder for an explicit preorder and unknown otherwise.
 Set match_type to exact when the item answers the requested model, alternative when offered instead of an unavailable request, or unsolicited for a supplier stock broadcast without a requester anchor.
 The current message is marked [CURRENT]. Prefer corrections and confirmations in the newest messages over older context.
-Confidence must be between 0 and 1. Missing quantity or availability should remain null/unknown rather than being invented; lower confidence only when an extracted value is ambiguous.`,
+Confidence must be between 0 and 1. Other missing quantity or availability should remain null/unknown rather than being invented; lower confidence only when an extracted value is ambiguous.`,
   json_schema: JSON.stringify({
     is_supplier_quotation: 'boolean',
     current_message_completes_quotation: 'boolean',
@@ -187,24 +187,42 @@ const EVIDENCE_BASES = new Set([
   'price_quantity_assumption'
 ]);
 
-function withTraceableLlmMapping(item, session, { forceAvailabilityAssumption = false } = {}) {
+function withTraceableLlmMapping(
+  item,
+  session,
+  { forceAvailabilityAssumption = false, assumeSingleUnit = false } = {}
+) {
   const allowedMessageIds = new Set((session.messages || []).map(message => Number(message.id)));
   const fallbackMessageIds = [...allowedMessageIds];
+  const supplierMessageIds = (session.evidence?.supplierMessageIds || [])
+    .map(Number)
+    .filter(id => allowedMessageIds.has(id));
   const evidence = {};
   let requiresStaffVerification = item.requires_staff_verification === true;
 
   for (const field of MAPPED_FIELDS) {
     const source = item.field_evidence?.[field] || {};
-    const messageIds = [...new Set((Array.isArray(source.message_ids) ? source.message_ids : [])
+    let messageIds = [...new Set((Array.isArray(source.message_ids) ? source.message_ids : [])
       .map(Number)
       .filter(id => Number.isInteger(id) && allowedMessageIds.has(id)))];
     let basis = EVIDENCE_BASES.has(source.basis) ? source.basis : 'contextual';
+    let explanation = String(source.explanation || 'Mapped by the LLM from the attached case transcript.').slice(0, 500);
+    if (field === 'quantity' && assumeSingleUnit) {
+      messageIds = supplierMessageIds;
+      basis = 'supplier_pattern_inference';
+      explanation = 'MRR review rule: defaulted to one unit because the supplier supplied an exact brand, model, size, and price without a quantity.';
+    }
     if (field === 'availability' && forceAvailabilityAssumption) basis = 'price_quantity_assumption';
+    if (field === 'availability' && assumeSingleUnit) {
+      messageIds = supplierMessageIds;
+      basis = 'price_quantity_assumption';
+      explanation = 'Prepared as ready stock from the exact priced supplier quote and the review-gated single-unit default.';
+    }
     if (basis !== 'explicit') requiresStaffVerification = true;
     evidence[field] = {
       message_ids: messageIds.length > 0 ? messageIds : fallbackMessageIds,
       basis,
-      explanation: String(source.explanation || 'Mapped by the LLM from the attached case transcript.').slice(0, 500)
+      explanation
     };
   }
 
@@ -212,6 +230,26 @@ function withTraceableLlmMapping(item, session, { forceAvailabilityAssumption = 
     ...item,
     field_evidence: evidence,
     requires_staff_verification: requiresStaffVerification
+  };
+}
+
+export function applyDefaultSingleUnitAssumption(item, supplierQuantities = []) {
+  if (
+    !item
+    || item.stock_quantity != null
+    || supplierQuantities.length > 0
+    || item.availability === 'preorder'
+  ) {
+    return { item, assumed: false };
+  }
+  return {
+    item: {
+      ...item,
+      stock_quantity: 1,
+      availability: item.availability === 'unknown' ? 'ready_stock' : item.availability,
+      requires_staff_verification: true
+    },
+    assumed: true
   };
 }
 
@@ -559,12 +597,17 @@ ${context}`,
           && sessionAvailability.availabilities.includes('ready_stock')
           ? 'ready_stock'
           : item.availability;
-        return withTraceableLlmMapping(
+        const defaulted = applyDefaultSingleUnitAssumption(
           { ...item, stock_quantity: stockQuantity, availability },
+          supplierQuantities
+        );
+        return withTraceableLlmMapping(
+          defaulted.item,
           session,
           {
-            forceAvailabilityAssumption: availability === 'ready_stock'
-              && sessionAvailability.evidence.includes('price_quantity_assumption')
+            forceAvailabilityAssumption: defaulted.item.availability === 'ready_stock'
+              && sessionAvailability.evidence.includes('price_quantity_assumption'),
+            assumeSingleUnit: defaulted.assumed
           }
         );
       });

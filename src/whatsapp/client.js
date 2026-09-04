@@ -43,7 +43,11 @@ import {
 } from '../oracle/dashboard-sync.js';
 import { getDisconnectPolicy } from './disconnect-policy.js';
 import { groupJidFrom, groupNameFrom } from './group-discovery.js';
-import { isNonConversationalMessageType } from './message-types.js';
+import {
+  isNonConversationalMessageType,
+  messageContentFromEnvelope,
+  selectConversationalMessageType
+} from './message-types.js';
 import {
   canonicalPhoneJid,
   resolvedSenderIdFromMessage,
@@ -101,7 +105,8 @@ const ingestionState = {
   senderMappingsResolved: 0,
   senderMappingsUnresolved: 0,
   reconciledSenderRows: 0,
-  recoveredHistoryQuotationChecks: 0
+  recoveredHistoryQuotationChecks: 0,
+  recoveredSidecarMessages: 0
 };
 const processStartedAt = new Date().toISOString();
 const RECONNECT_BASE_DELAY_MS = Math.max(1000, Number.parseInt(process.env.WHATSAPP_RECONNECT_BASE_DELAY_MS || '5000', 10));
@@ -135,6 +140,9 @@ let pendingGroupHistoryTotal = 0;
 let pendingDmHistoryTotal = 0;
 let senderReconciliationPromise = null;
 let recoveredHistoryProcessingPromise = null;
+let quotationRepairPromise = null;
+
+const QUOTATION_REPAIR_VERSION = 'sidecar-text-and-default-single-unit-v1';
 
 
 export function setSocketIO(io) {
@@ -496,6 +504,100 @@ async function reconcileStoredLidSenders() {
   return senderReconciliationPromise;
 }
 
+function repairStoredSidecarMessages(accountId) {
+  if (!accountId) return [];
+  const candidates = db.prepare(`
+    SELECT *
+    FROM messages
+    WHERE account_id = ?
+      AND message_type IN ('senderKeyDistributionMessage', 'protocolMessage', 'messageContextInfo')
+      AND raw_json IS NOT NULL
+    ORDER BY timestamp ASC, id ASC
+  `).all(accountId);
+  const update = db.prepare(`
+    UPDATE messages
+    SET message_type = ?, content = ?, source = 'catchup'
+    WHERE id = ?
+  `);
+  const repairedIds = db.transaction(rows => {
+    const ids = [];
+    for (const row of rows) {
+      try {
+        const raw = JSON.parse(row.raw_json || '{}');
+        const normalized = normalizeMessageContent(raw.message);
+        const messageType = selectConversationalMessageType(normalized);
+        if (!messageType || isNonConversationalMessageType(messageType)) continue;
+        const content = messageContentFromEnvelope(normalized, messageType);
+        if (!content) continue;
+        update.run(messageType, content, row.id);
+        ids.push(row.id);
+      } catch {
+        // Keep the original audit row untouched when its raw envelope cannot
+        // be parsed safely.
+      }
+    }
+    return ids;
+  })(candidates);
+
+  if (repairedIds.length === 0) return [];
+  ingestionState.recoveredSidecarMessages += repairedIds.length;
+  return db.prepare(`
+    SELECT * FROM messages
+    WHERE id IN (${repairedIds.map(() => '?').join(', ')})
+    ORDER BY timestamp ASC, id ASC
+  `).all(...repairedIds);
+}
+
+function recentRepairCandidateCases(accountId) {
+  const cutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+  return db.prepare(`
+    SELECT c.id, c.last_message_id
+    FROM oracle_quote_cases c
+    WHERE c.account_id = ?
+      AND c.status IN ('expired', 'incomplete')
+      AND c.last_activity_at >= ?
+      AND c.last_message_id IS NOT NULL
+    ORDER BY c.last_activity_at ASC, c.id ASC
+  `).all(accountId, cutoff);
+}
+
+function reopenCasesForQuotationRepair(cases) {
+  const reopen = db.prepare(`
+    UPDATE oracle_quote_cases
+    SET status = 'incomplete', completed_at = NULL, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ? AND status = 'expired'
+  `);
+  db.transaction(rows => {
+    for (const caseRecord of rows) reopen.run(caseRecord.id);
+  })(cases);
+}
+
+async function reprocessQuotationRepairCases(cases) {
+  let processed = 0;
+  let failed = 0;
+  for (const candidate of cases) {
+    const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(candidate.last_message_id);
+    const group = message
+      ? db.prepare('SELECT * FROM groups WHERE id = ?').get(message.group_id)
+      : null;
+    if (!message || !group || !isConfiguredSupplierMessage(message, group)) continue;
+    try {
+      const result = await processOracleGroupMessage({
+        message,
+        group,
+        allowAutoPublish: false
+      });
+      emitOracleResult(result);
+      processed++;
+      if (result?.error) failed++;
+    } catch (error) {
+      failed++;
+      emitLog(`Quotation repair could not recheck case #${candidate.id}: ${error.message}`);
+    }
+  }
+  return { processed, failed };
+}
+
 async function processUnparsedRecoveredSupplierHistory() {
   if (recoveredHistoryProcessingPromise) return recoveredHistoryProcessingPromise;
   const accountId = activeSocketAccountId();
@@ -508,7 +610,7 @@ async function processUnparsedRecoveredSupplierHistory() {
       JOIN groups g ON g.id = m.group_id
       WHERE m.account_id = ?
         AND m.chat_type = 'group'
-        AND m.source = 'history'
+        AND m.source IN ('history', 'catchup')
         AND g.is_monitored = 1
         AND g.oracle_sync_enabled = 1
         AND NOT EXISTS (
@@ -554,8 +656,42 @@ async function processUnparsedRecoveredSupplierHistory() {
 }
 
 async function maintainRecoveredSupplierHistory() {
-  await reconcileStoredLidSenders();
-  return processUnparsedRecoveredSupplierHistory();
+  if (quotationRepairPromise) return quotationRepairPromise;
+  quotationRepairPromise = (async () => {
+    const accountId = activeSocketAccountId();
+    if (!accountId) return 0;
+
+    const repairedMessages = repairStoredSidecarMessages(accountId);
+    if (repairedMessages.length > 0) {
+      emitLog(`Recovered ${repairedMessages.length} conversational message${repairedMessages.length === 1 ? '' : 's'} that arrived with WhatsApp sender-key metadata.`);
+    }
+
+    await reconcileStoredLidSenders();
+    const storedVersion = db.prepare("SELECT value FROM settings WHERE key = 'quotation_repair_version'").get()?.value;
+    const needsRepairReplay = storedVersion !== QUOTATION_REPAIR_VERSION || repairedMessages.length > 0;
+    const candidateCases = needsRepairReplay ? recentRepairCandidateCases(accountId) : [];
+    if (candidateCases.length > 0) reopenCasesForQuotationRepair(candidateCases);
+
+    const recoveredChecks = await processUnparsedRecoveredSupplierHistory();
+    const replay = needsRepairReplay
+      ? await reprocessQuotationRepairCases(candidateCases)
+      : { processed: 0, failed: 0 };
+
+    if (needsRepairReplay && replay.failed === 0) {
+      db.prepare(`
+        INSERT INTO settings (key, value) VALUES ('quotation_repair_version', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(QUOTATION_REPAIR_VERSION);
+    }
+    if (replay.processed > 0) {
+      emitLog(`Rechecked ${replay.processed} recent incomplete quotation case${replay.processed === 1 ? '' : 's'} using the recovered transcript and current business rules.`);
+    }
+    return recoveredChecks + replay.processed;
+  })().finally(() => {
+    quotationRepairPromise = null;
+    broadcastState();
+  });
+  return quotationRepairPromise;
 }
 
 export async function requestPairingCode(phoneNumber) {
@@ -1323,10 +1459,14 @@ async function handleIncomingMessage(msg, options = {}) {
     const timestamp = new Date(messageTimestampMs(msg) || Date.now()).toISOString();
 
     // Determine message type & text content
-    const messageType = Object.keys(normalizedMessage)[0];
-    if (!messageType) return { saved: false, reason: 'missing_message_type' };
-    if (isNonConversationalMessageType(messageType)) {
-      return { saved: false, reason: 'non_conversational_message_type' };
+    const messageType = selectConversationalMessageType(normalizedMessage);
+    if (!messageType) {
+      const hasProtocolMetadata = Object.keys(normalizedMessage)
+        .some(isNonConversationalMessageType);
+      return {
+        saved: false,
+        reason: hasProtocolMetadata ? 'non_conversational_message_type' : 'missing_message_type'
+      };
     }
     const replyToWaMessageId = normalizedMessage?.[messageType]?.contextInfo?.stanzaId || null;
     let content = '';

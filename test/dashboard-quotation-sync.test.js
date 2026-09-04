@@ -153,6 +153,10 @@ test('builds a traceable idempotent dashboard quotation payload and durable outb
     assert.equal(payload.contextMessages[0].includedInCase, true);
     assert.equal(payload.contextMessages.length, 2);
     assert.ok(payload.contextMessages.every(message => message.messageType === 'conversation'));
+    assert.deepEqual(payload.contextMessages.map(message => message.quotationRole), [
+      'quote_request',
+      'supplier_quotation'
+    ]);
     assert.ok(payload.messages.every(message => message.messageType === 'conversation'));
     assert.ok(payload.contextMessages.every(message => !message.body.includes('senderKeyDistributionMessage')));
     assert.match(payload.sourceRevision, /^[a-f0-9]{64}$/);

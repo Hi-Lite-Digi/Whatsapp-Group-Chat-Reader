@@ -592,6 +592,7 @@ app.get('/api/oracle/cases/:id/audit', (req, res) => {
     .filter(message => isConversationalMessageType(message.message_type))
     .map(message => ({
       ...message,
+      quotation_role: message.role === 'supplier' ? 'supplier_quotation' : 'quote_request',
       triggered_run_ids: triggerRunIdsByMessage.get(message.id) || []
     }));
   const attachedMessageIds = new Set(messages.map(message => message.id));
@@ -604,6 +605,9 @@ app.get('/api/oracle/cases/:id/audit', (req, res) => {
       ...message,
       role: supplierSenderIds.has(message.sender_id) ? 'supplier' : 'requester',
       included_in_case: attachedMessageIds.has(message.id),
+      quotation_role: attachedMessageIds.has(message.id)
+        ? supplierSenderIds.has(message.sender_id) ? 'supplier_quotation' : 'quote_request'
+        : 'context',
       exclusion_reason: attachedMessageIds.has(message.id)
         ? null
         : 'Nearby message not attached by the quotation correlation rules.'

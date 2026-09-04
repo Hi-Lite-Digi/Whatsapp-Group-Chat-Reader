@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  applyDefaultSingleUnitAssumption,
   findExactOracleListing,
   findSupersededCaseEvent,
   isConfiguredSupplierMessage,
@@ -12,6 +13,28 @@ import {
   buildOracleQuotationPayload,
   missingOracleReadyFields
 } from '../src/oracle/readiness.js';
+
+test('defaults an exact priced supplier quote to one review-gated unit', () => {
+  const result = applyDefaultSingleUnitAssumption({
+    brand: 'Continental',
+    model: 'SportContact-7',
+    size: '295/30/21',
+    price: 500,
+    stock_quantity: null,
+    availability: 'unknown'
+  });
+  assert.equal(result.assumed, true);
+  assert.equal(result.item.stock_quantity, 1);
+  assert.equal(result.item.availability, 'ready_stock');
+  assert.equal(result.item.requires_staff_verification, true);
+
+  const preorder = applyDefaultSingleUnitAssumption({
+    brand: 'Continental', model: 'SportContact-7', size: '295/30/21', price: 500,
+    stock_quantity: null, availability: 'preorder'
+  });
+  assert.equal(preorder.assumed, false);
+  assert.equal(preorder.item.stock_quantity, null);
+});
 
 test('normalizes common passenger tyre-size formats', () => {
   for (const input of ['225/45R18', '225/45/18', '225 45 18', '2254518']) {

@@ -333,6 +333,7 @@ export function buildQuotationSession({
       hasNegativeAvailability: NEGATIVE_PATTERN.test(supplierText),
       hasRequesterAnchor: requestAnchor >= 0,
       supplierMessageCount: supplierMessages.length,
+      supplierMessageIds: supplierMessages.map(message => Number(message.id)),
       requesterText,
       supplierText
     }
