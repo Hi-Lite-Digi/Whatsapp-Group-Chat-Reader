@@ -43,6 +43,9 @@ DB_PATH=/app/runtime/data/whatsapp_bot.db
 BACKUP_DIR=/app/runtime/backups
 BACKUP_RETENTION_DAYS=14
 ORACLE_PRICING_URL=https://tyre-pricing.onrender.com
+MRRJESTIC_DASHBOARD_URL=https://hilitedigisite-dashboard-integratio.vercel.app
+MRRJESTIC_DASHBOARD_SYNC_INTERVAL_MS=30000
+MRRJESTIC_DASHBOARD_SYNC_TIMEOUT_MS=10000
 WHATSAPP_RECONNECT_BASE_DELAY_MS=5000
 WHATSAPP_RECONNECT_MAX_DELAY_MS=300000
 WHATSAPP_RECONNECT_WATCHDOG_MS=60000
@@ -61,7 +64,7 @@ secret_json=$(aws secretsmanager get-secret-value \
   --query SecretString \
   --output text)
 printf '%s' "$secret_json" | jq -r '
-  ["OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "ORACLE_API_TOKEN", "MONITOR_TOKEN"] as $allowed
+  ["OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY", "ORACLE_API_TOKEN", "MONITOR_TOKEN", "MRRJESTIC_DASHBOARD_INGEST_KEY"] as $allowed
   | to_entries[]
   | select(.key as $key | $allowed | index($key))
   | select(.value != null)
