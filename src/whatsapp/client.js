@@ -142,7 +142,7 @@ let senderReconciliationPromise = null;
 let recoveredHistoryProcessingPromise = null;
 let quotationRepairPromise = null;
 
-const QUOTATION_REPAIR_VERSION = 'sidecar-text-and-default-single-unit-v1';
+const QUOTATION_REPAIR_VERSION = 'sidecar-text-case-consolidation-v2';
 
 
 export function setSocketIO(io) {
@@ -561,6 +561,112 @@ function recentRepairCandidateCases(accountId) {
   `).all(accountId, cutoff);
 }
 
+function consolidateRecoveredQuotationCases(accountId) {
+  const cutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+  const cases = db.prepare(`
+    SELECT *
+    FROM oracle_quote_cases
+    WHERE account_id = ?
+      AND last_activity_at >= ?
+      AND status IN ('ambiguous', 'expired', 'incomplete')
+    ORDER BY id ASC
+  `).all(accountId, cutoff);
+  const messageIdsForCase = db.prepare(`
+    SELECT message_id FROM oracle_quote_case_messages WHERE case_id = ? ORDER BY message_id
+  `);
+  const attach = db.prepare(`
+    INSERT OR IGNORE INTO oracle_quote_case_messages (
+      case_id, message_id, role, correlation_score, match_reasons_json
+    )
+    SELECT ?, message_id, role, correlation_score, match_reasons_json
+    FROM oracle_quote_case_messages
+    WHERE case_id = ?
+  `);
+  const updateTarget = db.prepare(`
+    UPDATE oracle_quote_cases
+    SET requester_sender_id = ?, request_message_id = ?, status = 'incomplete',
+        known_fields_json = ?, missing_fields_json = ?, source_message_ids = ?,
+        last_message_id = ?, last_reason = 'recovered_transcript_replay',
+        opened_at = ?, last_activity_at = ?, expires_at = ?,
+        completed_at = NULL, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `);
+  const markDuplicate = db.prepare(`
+    UPDATE oracle_quote_cases
+    SET status = 'duplicate', last_reason = ?, updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `);
+
+  const merges = [];
+  db.transaction(rows => {
+    for (const source of rows) {
+      if (!source.request_message_id) continue;
+      const sourceMessageIds = messageIdsForCase.all(source.id).map(row => Number(row.message_id));
+      if (sourceMessageIds.length < 2) continue;
+      const sourceSet = new Set(sourceMessageIds);
+      const target = rows.find(candidate => {
+        if (candidate.id >= source.id || candidate.request_message_id) return false;
+        if (candidate.group_id !== source.group_id || candidate.supplier_code !== source.supplier_code) return false;
+        const candidateIds = messageIdsForCase.all(candidate.id).map(row => Number(row.message_id));
+        return candidateIds.length > 0 && candidateIds.every(id => sourceSet.has(id));
+      });
+      if (!target) continue;
+
+      attach.run(target.id, source.id);
+      updateTarget.run(
+        source.requester_sender_id,
+        source.request_message_id,
+        source.known_fields_json,
+        source.missing_fields_json,
+        source.source_message_ids,
+        source.last_message_id,
+        source.opened_at,
+        source.last_activity_at,
+        source.expires_at,
+        target.id
+      );
+      markDuplicate.run(`merged_into_case_${target.id}`, source.id);
+      merges.push({ targetCaseId: target.id, duplicateCaseId: source.id });
+    }
+  })(cases);
+  return merges;
+}
+
+function recentCatchupSupplierMessages(accountId) {
+  const cutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+  return db.prepare(`
+    SELECT m.*
+    FROM messages m
+    JOIN groups g ON g.id = m.group_id
+    WHERE m.account_id = ?
+      AND m.source = 'catchup'
+      AND m.timestamp >= ?
+      AND m.chat_type = 'group'
+      AND g.is_monitored = 1
+      AND g.oracle_sync_enabled = 1
+    ORDER BY m.timestamp ASC, m.id ASC
+  `).all(accountId, cutoff);
+}
+
+async function replayRecentCatchupSupplierMessages(accountId) {
+  let processed = 0;
+  let failed = 0;
+  for (const message of recentCatchupSupplierMessages(accountId)) {
+    const group = db.prepare('SELECT * FROM groups WHERE id = ?').get(message.group_id);
+    if (!group || !isConfiguredSupplierMessage(message, group)) continue;
+    try {
+      const result = await processOracleGroupMessage({ message, group, allowAutoPublish: false });
+      emitOracleResult(result);
+      processed++;
+      if (result?.error) failed++;
+    } catch (error) {
+      failed++;
+      emitLog(`Recovered supplier message #${message.id} could not be replayed: ${error.message}`);
+    }
+  }
+  return { processed, failed };
+}
+
 function reopenCasesForQuotationRepair(cases) {
   const reopen = db.prepare(`
     UPDATE oracle_quote_cases
@@ -669,15 +775,22 @@ async function maintainRecoveredSupplierHistory() {
     await reconcileStoredLidSenders();
     const storedVersion = db.prepare("SELECT value FROM settings WHERE key = 'quotation_repair_version'").get()?.value;
     const needsRepairReplay = storedVersion !== QUOTATION_REPAIR_VERSION || repairedMessages.length > 0;
+    const merges = needsRepairReplay ? consolidateRecoveredQuotationCases(accountId) : [];
+    for (const merge of merges) {
+      queueDashboardQuotationCase(merge.duplicateCaseId);
+    }
     const candidateCases = needsRepairReplay ? recentRepairCandidateCases(accountId) : [];
     if (candidateCases.length > 0) reopenCasesForQuotationRepair(candidateCases);
 
+    const catchupReplay = needsRepairReplay
+      ? await replayRecentCatchupSupplierMessages(accountId)
+      : { processed: 0, failed: 0 };
     const recoveredChecks = await processUnparsedRecoveredSupplierHistory();
     const replay = needsRepairReplay
       ? await reprocessQuotationRepairCases(candidateCases)
       : { processed: 0, failed: 0 };
 
-    if (needsRepairReplay && replay.failed === 0) {
+    if (needsRepairReplay && catchupReplay.failed === 0 && replay.failed === 0) {
       db.prepare(`
         INSERT INTO settings (key, value) VALUES ('quotation_repair_version', ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -686,7 +799,10 @@ async function maintainRecoveredSupplierHistory() {
     if (replay.processed > 0) {
       emitLog(`Rechecked ${replay.processed} recent incomplete quotation case${replay.processed === 1 ? '' : 's'} using the recovered transcript and current business rules.`);
     }
-    return recoveredChecks + replay.processed;
+    if (merges.length > 0) {
+      emitLog(`Consolidated ${merges.length} duplicate quotation case${merges.length === 1 ? '' : 's'} created from previously hidden WhatsApp text.`);
+    }
+    return recoveredChecks + catchupReplay.processed + replay.processed;
   })().finally(() => {
     quotationRepairPromise = null;
     broadcastState();
